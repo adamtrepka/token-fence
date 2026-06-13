@@ -1,0 +1,58 @@
+# OS noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+
+# Python packaging/build artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Node / JS
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.yarn-cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+
+# Generated ML/data artifacts
+*.onnx
+*.joblib
+*.pkl
+*.pickle
+*.sav
+
+# OpenCode / dataset outputs
+tools/.venv/
+tools/__pycache__/
+tools/*.jsonl
+tools/dataset-shell/
+tools/model-shell/
+tools/casifier_tools.egg-info/
+tools/shell-only.jsonl
+
+# Local editor/runtime data
+.vscode/
+.idea/
+*.swp
+*.swo
