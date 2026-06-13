@@ -14,6 +14,7 @@ This directory contains the Python tooling for the Casifier pipeline.
 ## Project layout
 - `collect_opencode_cli.py` - exports raw OpenCode tool calls to JSONL.
 - `build_shell_dataset.py` - turns raw shell calls into train/val/test JSONL files.
+- `shell_features.py` - shared generic shell tokenization and feature extraction.
 - `train_shell_model.py` - trains the shell blocker and exports ONNX.
 - `pyproject.toml` - project metadata and console scripts.
 
@@ -66,11 +67,24 @@ This produces:
 - `model-shell/threshold.json`
 - `model-shell/manifest.json`
 
+## Step 4: Audit the model
+Inspect errors and feature weights:
+
+```bash
+uv run casifier-audit-shell-model --output shell-model-audit.md
+```
+
+This writes:
+- `shell-model-audit.md`
+- `shell-model-audit.json`
+
 ## Model input
 The trainer builds a token stream from:
 - `cwd`
 - the shell `command`
-- simple shell features like argument count, pipes, redirects, globs, recursion, and cwd depth
+- generic shell tokenization, command-shape tokens, command length, multiline batches, chain/pipe/redirect counts, globs, recursion, and cwd depth
+- optional feature selection via chi-square top-k filtering
+- recall-biased threshold selection by default so the blocker prefers catching risky commands over being conservative
 
 ## Notes
 - v1 is shell-only (`bash`).

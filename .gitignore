@@ -46,10 +46,13 @@ node_modules/
 tools/.venv/
 tools/__pycache__/
 tools/*.jsonl
+tools/*.back
+tools/shell-model-audit.*
 tools/dataset-shell/
 tools/model-shell/
 tools/casifier_tools.egg-info/
 tools/shell-only.jsonl
+opencode-session-notes.md
 
 # Local editor/runtime data
 .vscode/

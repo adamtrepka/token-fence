@@ -18,6 +18,7 @@ dependencies = [
 casifier-collect = "collect_opencode_cli:main"
 casifier-build-dataset = "build_shell_dataset:main"
 casifier-train-shell-model = "train_shell_model:main"
+casifier-audit-shell-model = "audit_shell_model:main"
 
 [tool.setuptools]
-py-modules = ["collect_opencode_cli", "build_shell_dataset", "train_shell_model"]
+py-modules = ["collect_opencode_cli", "build_shell_dataset", "shell_features", "train_shell_model", "audit_shell_model"]
