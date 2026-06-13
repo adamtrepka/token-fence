@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Iterable
 
@@ -24,12 +23,15 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.feature_selection import SelectKBest, chi2
 from sklearn.pipeline import Pipeline
+
+from shell_features import build_model_text
 
 
 DEFAULT_INPUT_DIR = Path("dataset-shell")
 DEFAULT_OUTPUT_DIR = Path("model-shell")
-WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+WARN_THRESHOLD_FLOOR = 0.05
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,6 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of TF-IDF features.",
     )
     parser.add_argument(
+        "--select-k",
+        type=int,
+        default=None,
+        help="Keep only the top-k TF-IDF features by chi-square score.",
+    )
+    parser.add_argument(
         "--C",
         dest="C",
         type=float,
@@ -88,8 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--threshold-beta",
         type=float,
-        default=0.5,
-        help="Beta for threshold selection on the validation set.",
+        default=2.0,
+        help="Beta for recall-biased threshold selection on the validation set.",
     )
     parser.add_argument(
         "--seed",
@@ -123,6 +131,14 @@ def load_split(input_dir: Path, name: str) -> list[dict[str, object]]:
     return read_jsonl(path)
 
 
+def load_splits(input_dir: Path) -> dict[str, list[dict[str, object]]]:
+    return {
+        "train": load_split(input_dir, "train"),
+        "val": load_split(input_dir, "val"),
+        "test": load_split(input_dir, "test"),
+    }
+
+
 def get_input(row: dict[str, object]) -> dict[str, object]:
     value = row.get("input")
     return value if isinstance(value, dict) else {}
@@ -152,51 +168,8 @@ def get_command(row: dict[str, object]) -> str:
     return ""
 
 
-def tokenize_words(text: str) -> list[str]:
-    return WORD_RE.findall(text.lower())
-
-
-def bucketize(value: int, buckets: list[tuple[int, str]]) -> str:
-    for upper, label in buckets:
-        if value <= upper:
-            return label
-    return buckets[-1][1]
-
-
-def feature_tokens(row: dict[str, object]) -> list[str]:
-    features = row.get("features")
-    if not isinstance(features, dict):
-        features = {}
-
-    input_length = int(features.get("input_length") or 0)
-    arg_count = int(features.get("arg_count") or 0)
-    token_count = int(features.get("token_count") or 0)
-    pipe_count = int(features.get("pipe_count") or 0)
-    redirect_count = int(features.get("redirect_count") or 0)
-    glob_count = int(features.get("glob_count") or 0)
-    cwd_depth = int(features.get("cwd_depth") or 0)
-
-    tokens = ["tool_bash"]
-    tokens.append(f"input_len_{bucketize(input_length, [(20, '0_20'), (40, '21_40'), (80, '41_80'), (160, '81_160'), (320, '161_320'), (10**9, '321_plus')])}")
-    tokens.append(f"arg_count_{bucketize(arg_count, [(0, '0'), (1, '1'), (3, '2_3'), (7, '4_7'), (10**9, '8_plus')])}")
-    tokens.append(f"token_count_{bucketize(token_count, [(1, '1'), (2, '2'), (4, '3_4'), (8, '5_8'), (10**9, '9_plus')])}")
-    tokens.append(f"pipe_count_{bucketize(pipe_count, [(0, '0'), (1, '1'), (10**9, '2_plus')])}")
-    tokens.append(f"redirect_count_{bucketize(redirect_count, [(0, '0'), (1, '1'), (10**9, '2_plus')])}")
-    tokens.append(f"glob_count_{bucketize(glob_count, [(0, '0'), (1, '1'), (10**9, '2_plus')])}")
-    tokens.append(f"cwd_depth_{bucketize(cwd_depth, [(0, '0'), (1, '1'), (2, '2'), (5, '3_5'), (10**9, '6_plus')])}")
-
-    for flag in ("has_recursive", "has_find", "has_rg", "has_grep", "has_sudo", "has_pipe", "has_redirect"):
-        tokens.append(f"{flag}_{int(bool(features.get(flag)))}")
-
-    return tokens
-
-
 def build_text(row: dict[str, object]) -> str:
-    tokens: list[str] = []
-    tokens.extend(f"cwd_{token}" for token in tokenize_words(get_workdir(row)))
-    tokens.extend(f"cmd_{token}" for token in tokenize_words(get_command(row)))
-    tokens.extend(feature_tokens(row))
-    return " ".join(tokens)
+    return build_model_text(get_command(row), get_workdir(row))
 
 
 def extract_label(row: dict[str, object]) -> int:
@@ -213,31 +186,34 @@ def make_xy(rows: Iterable[dict[str, object]]) -> tuple[list[str], np.ndarray]:
 
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
-    return Pipeline(
-        steps=[
-            (
-                "vectorizer",
-                TfidfVectorizer(
-                    analyzer="word",
-                    ngram_range=(args.ngram_min, args.ngram_max),
-                    min_df=args.min_df,
-                    max_features=args.max_features,
-                    lowercase=False,
-                    sublinear_tf=True,
-                ),
+    steps: list[tuple[str, object]] = [
+        (
+            "vectorizer",
+            TfidfVectorizer(
+                analyzer="word",
+                ngram_range=(args.ngram_min, args.ngram_max),
+                min_df=args.min_df,
+                max_features=args.max_features,
+                lowercase=False,
+                sublinear_tf=True,
             ),
-            (
-                "classifier",
-                LogisticRegression(
-                    C=args.C,
-                    class_weight="balanced",
-                    max_iter=args.max_iter,
-                    random_state=args.seed,
-                    solver="liblinear",
-                ),
+        ),
+    ]
+    if args.select_k is not None:
+        steps.append(("selector", SelectKBest(score_func=chi2, k=args.select_k)))
+    steps.append(
+        (
+            "classifier",
+            LogisticRegression(
+                C=args.C,
+                class_weight="balanced",
+                max_iter=args.max_iter,
+                random_state=args.seed,
+                solver="liblinear",
             ),
-        ]
+        )
     )
+    return Pipeline(steps=steps)
 
 
 def positive_proba(model: Pipeline, texts: list[str]) -> np.ndarray:
@@ -245,6 +221,10 @@ def positive_proba(model: Pipeline, texts: list[str]) -> np.ndarray:
     if proba.ndim != 2 or proba.shape[1] < 2:
         raise RuntimeError("Expected binary probability output from the classifier.")
     return proba[:, 1]
+
+
+def warn_threshold(block_threshold: float) -> float:
+    return max(WARN_THRESHOLD_FLOOR, block_threshold * 0.5)
 
 
 def best_threshold(y_true: np.ndarray, y_score: np.ndarray, beta: float) -> tuple[float, dict[str, float]]:
@@ -345,32 +325,7 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
-    train_rows = load_split(args.input_dir, "train")
-    val_rows = load_split(args.input_dir, "val")
-    test_rows = load_split(args.input_dir, "test")
-
-    train_texts, y_train = make_xy(train_rows)
-    val_texts, y_val = make_xy(val_rows)
-    test_texts, y_test = make_xy(test_rows)
-
-    pipeline = build_pipeline(args)
-    pipeline.fit(train_texts, y_train)
-
-    val_score = positive_proba(pipeline, val_texts)
-    threshold, threshold_stats = best_threshold(y_val, val_score, args.threshold_beta)
-
-    val_metrics = evaluate(y_val, val_score, threshold)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    sklearn_path = args.output_dir / "model.joblib"
-    onnx_path = args.output_dir / "model.onnx"
-    write_json(args.output_dir / "threshold.json", {"block_threshold": threshold, "warn_threshold": max(0.05, threshold * 0.5)})
-
-    dump(pipeline, sklearn_path)
-
+def export_onnx_model(pipeline: Pipeline, onnx_path: Path) -> None:
     onnx_model = convert_sklearn(
         pipeline,
         initial_types=[("text", StringTensorType([None, 1]))],
@@ -379,13 +334,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     onnx.save_model(onnx_model, onnx_path)
 
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    onnx_score = onnx_positive_proba(session, test_texts)
-    onnx_metrics = evaluate(y_test, onnx_score, threshold)
-    sklearn_test_score = positive_proba(pipeline, test_texts)
-    parity_max_abs_diff = float(np.max(np.abs(onnx_score - sklearn_test_score)))
 
-    manifest = {
+def build_manifest(
+    args: argparse.Namespace,
+    split_rows: dict[str, list[dict[str, object]]],
+    labels: dict[str, np.ndarray],
+    threshold: float,
+    threshold_stats: dict[str, float],
+    val_metrics: dict[str, object],
+    sklearn_test_metrics: dict[str, object],
+    onnx_metrics: dict[str, object],
+    parity_max_abs_diff: float,
+    sklearn_path: Path,
+    onnx_path: Path,
+) -> dict[str, object]:
+    manifest: dict[str, object] = {
         "schema_version": 1,
         "model_type": "tfidf-word-logreg",
         "input_dir": str(args.input_dir),
@@ -408,21 +371,21 @@ def main(argv: list[str] | None = None) -> int:
         },
         "threshold": {
             "block_threshold": threshold,
-            "warn_threshold": max(0.05, threshold * 0.5),
+            "warn_threshold": warn_threshold(threshold),
             "selection_beta": args.threshold_beta,
             "validation": threshold_stats,
         },
         "dataset": {
-            "train": len(train_rows),
-            "val": len(val_rows),
-            "test": len(test_rows),
-            "train_positive": int(y_train.sum()),
-            "val_positive": int(y_val.sum()),
-            "test_positive": int(y_test.sum()),
+            "train": len(split_rows["train"]),
+            "val": len(split_rows["val"]),
+            "test": len(split_rows["test"]),
+            "train_positive": int(labels["train"].sum()),
+            "val_positive": int(labels["val"].sum()),
+            "test_positive": int(labels["test"].sum()),
         },
         "metrics": {
             "val": val_metrics,
-            "test_sklearn": evaluate(y_test, sklearn_test_score, threshold),
+            "test_sklearn": sklearn_test_metrics,
             "test_onnx": onnx_metrics,
             "onnx_parity_max_abs_diff": parity_max_abs_diff,
         },
@@ -433,6 +396,65 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
 
+    if args.select_k is not None:
+        manifest["selector"] = {
+            "name": "SelectKBest",
+            "score_func": "chi2",
+            "k": args.select_k,
+        }
+
+    return manifest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    split_rows = load_splits(args.input_dir)
+
+    train_texts, y_train = make_xy(split_rows["train"])
+    val_texts, y_val = make_xy(split_rows["val"])
+    test_texts, y_test = make_xy(split_rows["test"])
+    labels = {"train": y_train, "val": y_val, "test": y_test}
+
+    pipeline = build_pipeline(args)
+    pipeline.fit(train_texts, y_train)
+
+    val_score = positive_proba(pipeline, val_texts)
+    threshold, threshold_stats = best_threshold(y_val, val_score, args.threshold_beta)
+
+    val_metrics = evaluate(y_val, val_score, threshold)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    sklearn_path = args.output_dir / "model.joblib"
+    onnx_path = args.output_dir / "model.onnx"
+    write_json(
+        args.output_dir / "threshold.json",
+        {"block_threshold": threshold, "warn_threshold": warn_threshold(threshold)},
+    )
+
+    dump(pipeline, sklearn_path)
+    export_onnx_model(pipeline, onnx_path)
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    onnx_score = onnx_positive_proba(session, test_texts)
+    onnx_metrics = evaluate(y_test, onnx_score, threshold)
+    sklearn_test_score = positive_proba(pipeline, test_texts)
+    sklearn_test_metrics = evaluate(y_test, sklearn_test_score, threshold)
+    parity_max_abs_diff = float(np.max(np.abs(onnx_score - sklearn_test_score)))
+
+    manifest = build_manifest(
+        args,
+        split_rows,
+        labels,
+        threshold,
+        threshold_stats,
+        val_metrics,
+        sklearn_test_metrics,
+        onnx_metrics,
+        parity_max_abs_diff,
+        sklearn_path,
+        onnx_path,
+    )
     write_json(args.output_dir / "manifest.json", manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
