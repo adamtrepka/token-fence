@@ -4,6 +4,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
+import { createHash } from "node:crypto";
 
 const require = createRequire(import.meta.url);
 const ort = require("onnxruntime-node");
@@ -57,6 +58,7 @@ const GENERIC_INTENTS = new Set([
 const MODEL_DIR = path.resolve(__dirname, "../../tools/model-shell");
 const MODEL_PATH = path.join(MODEL_DIR, "model.onnx");
 const THRESHOLD_PATH = path.join(MODEL_DIR, "threshold.json");
+const MANIFEST_PATH = path.join(MODEL_DIR, "manifest.json");
 const MAX_BUCKET = Number.MAX_SAFE_INTEGER;
 
 const COMMAND_CHAR_BUCKETS = [
@@ -99,6 +101,31 @@ const CWD_DEPTH_BUCKETS = [
   [7, "5_7"],
   [MAX_BUCKET, "8_plus"],
 ];
+
+const NATIVE_COUNT_BUCKETS = [[0, "0"], [1, "1"], [2, "2"], [5, "3_5"], [10, "6_10"], [25, "11_25"], [50, "26_50"], [100, "51_100"], [250, "101_250"], [MAX_BUCKET, "251_plus"]];
+const NATIVE_CHAR_BUCKETS = [[0, "0"], [80, "1_80"], [240, "81_240"], [800, "241_800"], [2000, "801_2000"], [8000, "2001_8000"], [32000, "8001_32000"], [MAX_BUCKET, "32001_plus"]];
+const NATIVE_DEPTH_BUCKETS = [[0, "0"], [1, "1"], [2, "2"], [4, "3_4"], [8, "5_8"], [MAX_BUCKET, "9_plus"]];
+const URL_VALUE_RE = /https?:\/\/\S+/gi;
+const PATH_EXTENSION_RE = /\.[A-Za-z0-9]{1,10}(?:$|[?#])/;
+const MARKDOWN_VALUE_RE = /(^|\n)\s{0,3}(?:#{1,6}\s|[-*+]\s|\d+\.\s|```|>)/;
+const CODE_VALUE_RE = /```|=>|[{};]|\b(?:class|def|function|import|select|from|where)\b/i;
+const GENERIC_VALUE_MARKERS = new Set(["bm25", "csv", "fit", "html", "json", "llm", "markdown", "md", "pdf", "png", "raw", "svg", "text", "xml", "yaml"]);
+const NEVER_BLOCK_NATIVE_TOOLS = new Set([
+  "apply_patch",
+  "delegate",
+  "delegation_list",
+  "delegation_read",
+  "edit",
+  "glob",
+  "grep",
+  "multi_tool_use.parallel",
+  "question",
+  "read",
+  "skill",
+  "task",
+  "todowrite",
+  "write",
+]);
 
 let statePromise = null;
 let runtimeConfig = {
@@ -340,6 +367,193 @@ function buildModelText(command, workdir = "") {
   return classified.join(" ");
 }
 
+function stableJsonValue(value) {
+  if (Array.isArray(value)) return value.map(stableJsonValue);
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value).sort()) {
+      const item = value[key];
+      if (typeof item !== "undefined") {
+        result[key] = stableJsonValue(item);
+      }
+    }
+    return result;
+  }
+  return typeof value === "undefined" ? null : value;
+}
+
+function canonicalJson(value) {
+  try {
+    return JSON.stringify(stableJsonValue(value)) || "null";
+  } catch {
+    return "null";
+  }
+}
+
+function normalizeIdentifier(value) {
+  const normalized = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return (normalized || "empty").slice(0, 80);
+}
+
+function toolIdentityFeature(tool, mode) {
+  if (mode === "none" || !tool) return null;
+  if (mode === "raw") return `tool_raw_${normalizeIdentifier(tool)}`;
+  return `tool_hash_${createHash("sha1").update(String(tool)).digest("hex").slice(0, 12)}`;
+}
+
+function isNativePathLike(value) {
+  const text = String(value || "").trim();
+  if (!text || /https?:\/\/\S+/i.test(text)) return false;
+  if (WINDOWS_PATH_RE.test(text) || POSIX_PATH_RE.test(text)) return true;
+  return (text.includes("/") || text.includes("\\")) && !/\s/.test(text) && PATH_EXTENSION_RE.test(text);
+}
+
+function nativeWordCount(value) {
+  return (String(value || "").match(/\w+/g) || []).length;
+}
+
+function emptyNativeStats() {
+  return {
+    input_json_chars: 0,
+    max_depth: 0,
+    object_count: 0,
+    array_count: 0,
+    field_count: 0,
+    max_object_fields: 0,
+    max_array_length: 0,
+    string_count: 0,
+    string_total_chars: 0,
+    string_max_chars: 0,
+    string_total_lines: 0,
+    string_max_lines: 0,
+    number_count: 0,
+    boolean_count: 0,
+    null_count: 0,
+    url_count: 0,
+    path_like_count: 0,
+    markdown_like_count: 0,
+    code_like_count: 0,
+    json_like_string_count: 0,
+    long_string_count: 0,
+    query_like_count: 0,
+    query_word_max: 0,
+    value_markers: new Set(),
+  };
+}
+
+function inspectNativeString(value, stats) {
+  const text = String(value || "");
+  const stripped = text.trim();
+  const lineCount = text ? text.split(/\r\n|\r|\n/).length : 0;
+  const words = nativeWordCount(text);
+
+  stats.string_count += 1;
+  stats.string_total_chars += text.length;
+  stats.string_max_chars = Math.max(stats.string_max_chars, text.length);
+  stats.string_total_lines += lineCount;
+  stats.string_max_lines = Math.max(stats.string_max_lines, lineCount);
+  stats.url_count += (text.match(URL_VALUE_RE) || []).length;
+
+  if (isNativePathLike(text)) stats.path_like_count += 1;
+  if (MARKDOWN_VALUE_RE.test(text)) stats.markdown_like_count += 1;
+  if (CODE_VALUE_RE.test(text)) stats.code_like_count += 1;
+  if ((stripped.startsWith("{") && stripped.endsWith("}")) || (stripped.startsWith("[") && stripped.endsWith("]"))) stats.json_like_string_count += 1;
+  if (text.length >= 1000) stats.long_string_count += 1;
+  if (words >= 3 && words <= 80 && !isNativePathLike(text)) {
+    stats.query_like_count += 1;
+    stats.query_word_max = Math.max(stats.query_word_max, words);
+  }
+
+  const marker = stripped.toLowerCase();
+  if (GENERIC_VALUE_MARKERS.has(marker)) stats.value_markers.add(marker);
+}
+
+function walkNativeInput(value, stats, depth = 0) {
+  stats.max_depth = Math.max(stats.max_depth, depth);
+
+  if (Array.isArray(value)) {
+    stats.array_count += 1;
+    stats.max_array_length = Math.max(stats.max_array_length, value.length);
+    for (const item of value) walkNativeInput(item, stats, depth + 1);
+    return;
+  }
+
+  if (value && typeof value === "object") {
+    const values = Object.values(value);
+    stats.object_count += 1;
+    stats.field_count += values.length;
+    stats.max_object_fields = Math.max(stats.max_object_fields, values.length);
+    for (const item of values) walkNativeInput(item, stats, depth + 1);
+    return;
+  }
+
+  if (typeof value === "string") {
+    inspectNativeString(value, stats);
+    return;
+  }
+  if (typeof value === "boolean") {
+    stats.boolean_count += 1;
+    return;
+  }
+  if (typeof value === "number") {
+    stats.number_count += 1;
+    return;
+  }
+  if (value === null || typeof value === "undefined") {
+    stats.null_count += 1;
+  }
+}
+
+function nativeBucketToken(prefix, value, buckets) {
+  return bucketTokens(prefix, Number(value) || 0, buckets);
+}
+
+function nativeTokens(stats, identity) {
+  const tokens = ["family_native"];
+  if (identity) tokens.push(identity);
+  tokens.push(nativeBucketToken("json_char_count", stats.input_json_chars, NATIVE_CHAR_BUCKETS));
+  tokens.push(nativeBucketToken("json_depth", stats.max_depth, NATIVE_DEPTH_BUCKETS));
+
+  for (const field of [
+    "object_count",
+    "array_count",
+    "field_count",
+    "max_object_fields",
+    "max_array_length",
+    "string_count",
+    "number_count",
+    "boolean_count",
+    "null_count",
+    "url_count",
+    "path_like_count",
+    "markdown_like_count",
+    "code_like_count",
+    "json_like_string_count",
+    "long_string_count",
+    "query_like_count",
+    "query_word_max",
+  ]) {
+    tokens.push(nativeBucketToken(field, stats[field], NATIVE_COUNT_BUCKETS));
+  }
+
+  tokens.push(nativeBucketToken("input_json_chars", stats.input_json_chars, NATIVE_CHAR_BUCKETS));
+  for (const field of ["string_total_chars", "string_max_chars", "string_total_lines", "string_max_lines"]) {
+    tokens.push(nativeBucketToken(field, stats[field], NATIVE_CHAR_BUCKETS));
+  }
+  for (const marker of Array.from(stats.value_markers).sort()) {
+    tokens.push(`value_marker_${marker}`);
+  }
+  return tokens;
+}
+
+function buildNativeModelText(inputRaw, tool, toolIdentityMode = "hash") {
+  const stats = emptyNativeStats();
+  stats.input_json_chars = canonicalJson(inputRaw).length;
+  walkNativeInput(inputRaw, stats);
+  const identity = toolIdentityFeature(tool, toolIdentityMode);
+  return nativeTokens(stats, identity).join(" ");
+}
+
 function resolveDirectory(directory) {
   if (typeof directory === "string") return directory;
   if (directory && typeof directory === "object") {
@@ -493,12 +707,35 @@ function extractPositiveProbability(outputMap) {
   return null;
 }
 
+async function readJsonIfExists(filePath) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function modelSupportsNativeTools(manifest) {
+  if (!manifest || typeof manifest !== "object") return false;
+  const template = String(manifest.text_template || "").toLowerCase();
+  if (template.includes("structured tool input")) return true;
+  const train = manifest.dataset && manifest.dataset.train;
+  return Boolean(train && train.by_family && train.by_family.native);
+}
+
+function nativeToolIdentityMode(manifest) {
+  const mode = manifest && manifest.feature_extraction && manifest.feature_extraction.native_tool_identity;
+  if (mode === "raw" || mode === "none" || mode === "hash") return mode;
+  return "hash";
+}
+
 async function ensureState() {
   if (!statePromise) {
     statePromise = (async () => {
       try {
-        const [thresholdRaw] = await Promise.all([
+        const [thresholdRaw, manifest] = await Promise.all([
           fs.readFile(THRESHOLD_PATH, "utf8"),
+          readJsonIfExists(MANIFEST_PATH),
           fs.access(MODEL_PATH),
         ]);
         const threshold = JSON.parse(thresholdRaw);
@@ -512,6 +749,8 @@ async function ensureState() {
           outputNames,
           blockThreshold: Number(threshold.block_threshold),
           warnThreshold: Number(threshold.warn_threshold || Math.max(0.05, Number(threshold.block_threshold) * 0.5)),
+          supportsNative: modelSupportsNativeTools(manifest),
+          toolIdentityMode: nativeToolIdentityMode(manifest),
         };
       } catch (error) {
         await logShellGuard("error", "plugin disabled", {
@@ -529,15 +768,24 @@ async function ensureState() {
   return statePromise;
 }
 
-async function scoreCommand(command, workdir) {
-  const state = await ensureState();
-  if (!state) return null;
-  const modelText = buildModelText(command, workdir);
+async function runModelScore(state, modelText) {
   const tensor = new ort.Tensor("string", [modelText], [1, 1]);
   const outputs = await state.session.run({ [state.inputName]: tensor });
   const score = extractPositiveProbability(outputs);
   if (typeof score !== "number" || Number.isNaN(score)) return null;
   return { score, state, modelText };
+}
+
+async function scoreCommand(command, workdir) {
+  const state = await ensureState();
+  if (!state) return null;
+  return runModelScore(state, `family_shell ${buildModelText(command, workdir)}`);
+}
+
+async function scoreNativeTool(tool, inputRaw) {
+  const state = await ensureState();
+  if (!state || !state.supportsNative) return null;
+  return runModelScore(state, buildNativeModelText(inputRaw, tool, state.toolIdentityMode));
 }
 
 function truncate(text, limit = 240) {
@@ -566,14 +814,39 @@ function isNestedOpenCodeSessionCommand(command) {
   return /^\s*opencode(?:\.exe|\.cmd|\.bat)?\s+(?:-s|--session)\b/i.test(String(command || ""));
 }
 
-async function handleToolExecuteBefore(input, output, defaultWorkdir) {
-  if (!input || input.tool !== "bash") return;
+function normalizeToolName(tool) {
+  return String(tool || "").trim().toLowerCase().replace(/^functions\./, "");
+}
+
+function isNeverBlockNativeTool(tool) {
+  return NEVER_BLOCK_NATIVE_TOOLS.has(normalizeToolName(tool));
+}
+
+function isBlockCapableNativeTool(tool) {
+  const name = normalizeToolName(tool);
+  if (!name || name === "bash") return false;
+  return !isNeverBlockNativeTool(name);
+}
+
+function resolveNativeInputRaw(input, output) {
+  const candidates = [
+    output && output.args,
+    input && input.args,
+    output && output.input,
+    input && input.input,
+    output && output.params,
+    input && input.params,
+  ];
+  for (const value of candidates) {
+    if (value && typeof value === "object") return value;
+  }
+  return {};
+}
+
+async function handleShellToolBefore(input, output, defaultWorkdir, agentRole, agentName) {
   const command = resolveCommand(input, output);
   if (!command) return;
   const workdir = resolveWorkdir(input, output, defaultWorkdir);
-  const sessionID = typeof input.sessionID === "string" ? input.sessionID : "";
-  const agentName = resolveAgentName(input, output) || sessionAgents.get(sessionID) || "";
-  const agentRole = sessionRoles.get(sessionID) || resolveAgentRole(agentName);
 
   if (agentRole !== "subagent" && isNestedOpenCodeSessionCommand(command)) {
     throw new Error(`shell guard blocked nested opencode session command: ${truncate(command)}`);
@@ -597,6 +870,7 @@ async function handleToolExecuteBefore(input, output, defaultWorkdir) {
   if (agentRole === "subagent") {
     if (score >= state.warnThreshold) {
       await logShellGuard("warn", "subagent warning", {
+        tool: "bash",
         role: agentRole,
         agent: agentName || "<unknown>",
         score: scoreText,
@@ -615,6 +889,7 @@ async function handleToolExecuteBefore(input, output, defaultWorkdir) {
 
   if (score >= state.warnThreshold) {
     await logShellGuard("warn", "command warning", {
+      tool: "bash",
       role: agentRole,
       agent: agentName || "<unknown>",
       score: scoreText,
@@ -623,6 +898,72 @@ async function handleToolExecuteBefore(input, output, defaultWorkdir) {
       cmd: commandText,
     });
   }
+}
+
+async function handleNativeToolBefore(input, output, agentRole, agentName) {
+  const tool = String(input && input.tool || "").trim();
+  if (!tool) return;
+
+  let result;
+  try {
+    result = await scoreNativeTool(tool, resolveNativeInputRaw(input, output));
+  } catch (error) {
+    await logShellGuard("error", "native scoring failed", {
+      tool,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+
+  if (!result) return;
+  const { score, state } = result;
+  const scoreText = score.toFixed(3);
+  const policy = isBlockCapableNativeTool(tool) ? "block_capable" : "never_block";
+
+  if (agentRole === "subagent") {
+    if (score >= state.warnThreshold) {
+      await logShellGuard("warn", "subagent native warning", {
+        tool,
+        policy: "warn_only",
+        role: agentRole,
+        agent: agentName || "<unknown>",
+        score: scoreText,
+        threshold: state.warnThreshold.toFixed(3),
+      });
+    }
+    return;
+  }
+
+  if (policy === "block_capable" && score >= state.blockThreshold) {
+    throw new Error(
+      `shell guard blocked ${tool} tool for ${agentRole} agent${agentName ? ` (${agentName})` : ""} (score=${scoreText}, threshold=${state.blockThreshold.toFixed(3)})`
+    );
+  }
+
+  if (score >= state.warnThreshold) {
+    await logShellGuard("warn", "native tool warning", {
+      tool,
+      policy,
+      role: agentRole,
+      agent: agentName || "<unknown>",
+      score: scoreText,
+      threshold: state.warnThreshold.toFixed(3),
+    });
+  }
+}
+
+async function handleToolExecuteBefore(input, output, defaultWorkdir) {
+  if (!input || !input.tool) return;
+  const sessionID = typeof input.sessionID === "string" ? input.sessionID : "";
+  const agentName = resolveAgentName(input, output) || sessionAgents.get(sessionID) || "";
+  const agentRole = sessionRoles.get(sessionID) || resolveAgentRole(agentName);
+
+  if (normalizeToolName(input.tool) === "bash") {
+    await handleShellToolBefore(input, output, defaultWorkdir, agentRole, agentName);
+    return;
+  }
+
+  await handleNativeToolBefore(input, output, agentRole, agentName);
 }
 
 export const ShellGuard = async function CasifierShellGuard(input) {

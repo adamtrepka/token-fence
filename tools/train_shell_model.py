@@ -36,7 +36,7 @@ WARN_THRESHOLD_FLOOR = 0.05
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train an ONNX-exportable shell blocker model from OpenCode data."
+        description="Train an ONNX-exportable output-risk model from OpenCode tool-call data."
     )
     parser.add_argument(
         "--input-dir",
@@ -168,8 +168,70 @@ def get_command(row: dict[str, object]) -> str:
     return ""
 
 
+def get_family(row: dict[str, object]) -> str:
+    family = row.get("tool_family")
+    if isinstance(family, str) and family.strip():
+        return family.strip()
+    return "unknown"
+
+
+def get_feature_tokens(row: dict[str, object]) -> list[str]:
+    features = row.get("features")
+    if not isinstance(features, dict):
+        return []
+    tokens = features.get("tokens")
+    if not isinstance(tokens, list):
+        return []
+    return [str(token).strip() for token in tokens if str(token).strip()]
+
+
 def build_text(row: dict[str, object]) -> str:
-    return build_model_text(get_command(row), get_workdir(row))
+    if get_family(row) == "shell":
+        return "family_shell " + build_model_text(get_command(row), get_workdir(row))
+
+    tokens = get_feature_tokens(row)
+    if tokens:
+        return " ".join(tokens)
+    return "family_native input_missing_tokens"
+
+
+def summarize_rows(rows: list[dict[str, object]]) -> dict[str, object]:
+    by_family: dict[str, dict[str, int]] = {}
+    positive = 0
+    for row in rows:
+        blocked = bool(row.get("label", {}).get("blocked")) if isinstance(row.get("label"), dict) else False
+        positive += int(blocked)
+        family = get_family(row)
+        if family not in by_family:
+            by_family[family] = {"rows": 0, "positive": 0, "negative": 0}
+        by_family[family]["rows"] += 1
+        if blocked:
+            by_family[family]["positive"] += 1
+        else:
+            by_family[family]["negative"] += 1
+    return {
+        "rows": len(rows),
+        "positive": positive,
+        "negative": len(rows) - positive,
+        "by_family": by_family,
+    }
+
+
+def infer_native_tool_identity(split_rows: dict[str, list[dict[str, object]]]) -> str:
+    modes: set[str] = set()
+    for rows in split_rows.values():
+        for row in rows:
+            if get_family(row) != "native":
+                continue
+            features = row.get("features")
+            if not isinstance(features, dict):
+                continue
+            mode = features.get("tool_identity_mode")
+            if isinstance(mode, str) and mode in {"hash", "raw", "none"}:
+                modes.add(mode)
+    if len(modes) == 1:
+        return next(iter(modes))
+    return "hash"
 
 
 def extract_label(row: dict[str, object]) -> int:
@@ -286,6 +348,23 @@ def evaluate(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[
     }
 
 
+def evaluate_by_family(
+    rows: list[dict[str, object]],
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float,
+) -> dict[str, dict[str, object]]:
+    indexes_by_family: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        indexes_by_family.setdefault(get_family(row), []).append(index)
+
+    metrics: dict[str, dict[str, object]] = {}
+    for family, indexes in sorted(indexes_by_family.items()):
+        index_array = np.asarray(indexes, dtype=np.int64)
+        metrics[family] = evaluate(y_true[index_array], y_score[index_array], threshold)
+    return metrics
+
+
 def onnx_positive_proba(session: ort.InferenceSession, texts: list[str]) -> np.ndarray:
     input_name = session.get_inputs()[0].name
     feed = {input_name: np.asarray(texts, dtype=object).reshape(-1, 1)}
@@ -338,12 +417,14 @@ def export_onnx_model(pipeline: Pipeline, onnx_path: Path) -> None:
 def build_manifest(
     args: argparse.Namespace,
     split_rows: dict[str, list[dict[str, object]]],
-    labels: dict[str, np.ndarray],
     threshold: float,
     threshold_stats: dict[str, float],
     val_metrics: dict[str, object],
+    val_family_metrics: dict[str, dict[str, object]],
     sklearn_test_metrics: dict[str, object],
+    sklearn_test_family_metrics: dict[str, dict[str, object]],
     onnx_metrics: dict[str, object],
+    onnx_family_metrics: dict[str, dict[str, object]],
     parity_max_abs_diff: float,
     sklearn_path: Path,
     onnx_path: Path,
@@ -352,7 +433,12 @@ def build_manifest(
         "schema_version": 1,
         "model_type": "tfidf-word-logreg",
         "input_dir": str(args.input_dir),
-        "text_template": "space-separated token stream derived from cwd, command and shell features",
+        "text_template": "space-separated token stream derived from shell command features or structured tool input features",
+        "feature_extraction": {
+            "shell_prefix": "family_shell",
+            "native_tokens": "features.tokens",
+            "native_tool_identity": infer_native_tool_identity(split_rows),
+        },
         "vectorizer": {
             "analyzer": "word",
             "ngram_range": [args.ngram_min, args.ngram_max],
@@ -375,18 +461,14 @@ def build_manifest(
             "selection_beta": args.threshold_beta,
             "validation": threshold_stats,
         },
-        "dataset": {
-            "train": len(split_rows["train"]),
-            "val": len(split_rows["val"]),
-            "test": len(split_rows["test"]),
-            "train_positive": int(labels["train"].sum()),
-            "val_positive": int(labels["val"].sum()),
-            "test_positive": int(labels["test"].sum()),
-        },
+        "dataset": {name: summarize_rows(rows) for name, rows in split_rows.items()},
         "metrics": {
             "val": val_metrics,
+            "val_by_family": val_family_metrics,
             "test_sklearn": sklearn_test_metrics,
+            "test_sklearn_by_family": sklearn_test_family_metrics,
             "test_onnx": onnx_metrics,
+            "test_onnx_by_family": onnx_family_metrics,
             "onnx_parity_max_abs_diff": parity_max_abs_diff,
         },
         "artifacts": {
@@ -415,7 +497,6 @@ def main(argv: list[str] | None = None) -> int:
     train_texts, y_train = make_xy(split_rows["train"])
     val_texts, y_val = make_xy(split_rows["val"])
     test_texts, y_test = make_xy(split_rows["test"])
-    labels = {"train": y_train, "val": y_val, "test": y_test}
 
     pipeline = build_pipeline(args)
     pipeline.fit(train_texts, y_train)
@@ -424,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     threshold, threshold_stats = best_threshold(y_val, val_score, args.threshold_beta)
 
     val_metrics = evaluate(y_val, val_score, threshold)
+    val_family_metrics = evaluate_by_family(split_rows["val"], y_val, val_score, threshold)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     sklearn_path = args.output_dir / "model.joblib"
     onnx_path = args.output_dir / "model.onnx"
@@ -438,19 +520,23 @@ def main(argv: list[str] | None = None) -> int:
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     onnx_score = onnx_positive_proba(session, test_texts)
     onnx_metrics = evaluate(y_test, onnx_score, threshold)
+    onnx_family_metrics = evaluate_by_family(split_rows["test"], y_test, onnx_score, threshold)
     sklearn_test_score = positive_proba(pipeline, test_texts)
     sklearn_test_metrics = evaluate(y_test, sklearn_test_score, threshold)
+    sklearn_test_family_metrics = evaluate_by_family(split_rows["test"], y_test, sklearn_test_score, threshold)
     parity_max_abs_diff = float(np.max(np.abs(onnx_score - sklearn_test_score)))
 
     manifest = build_manifest(
         args,
         split_rows,
-        labels,
         threshold,
         threshold_stats,
         val_metrics,
+        val_family_metrics,
         sklearn_test_metrics,
+        sklearn_test_family_metrics,
         onnx_metrics,
+        onnx_family_metrics,
         parity_max_abs_diff,
         sklearn_path,
         onnx_path,
