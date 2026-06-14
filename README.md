@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/header.png" alt="Token Fence header showing a fennec fox guarding a stream of tool-output tokens" />
+</p>
+
 # Token Fence
 
 [![CI](https://github.com/adamtrepka/token-fence/actions/workflows/ci.yml/badge.svg)](https://github.com/adamtrepka/token-fence/actions/workflows/ci.yml)
