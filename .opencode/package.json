@@ -1,0 +1,19 @@
+{
+  "name": "token-fence-opencode-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode output-risk guard plugin for Token Fence.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adamtrepka/token-fence.git",
+    "directory": ".opencode"
+  },
+  "type": "module",
+  "scripts": {
+    "check": "node --check plugins/shell-guard.js"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.14.48",
+    "onnxruntime-node": "^1.26.0"
+  }
+}

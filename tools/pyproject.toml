@@ -5,7 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "casifier-tools"
 version = "0.1.0"
+description = "Python tooling for Token Fence dataset collection and output-risk model training."
+readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+authors = [
+  { name = "Adam Trepka" },
+]
 dependencies = [
   "numpy",
   "scikit-learn",
@@ -13,12 +19,22 @@ dependencies = [
   "onnx",
   "onnxruntime",
 ]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/adamtrepka/token-fence"
+Repository = "https://github.com/adamtrepka/token-fence"
 
 [project.scripts]
 casifier-collect = "collect_opencode_cli:main"
 casifier-build-dataset = "build_shell_dataset:main"
 casifier-train-shell-model = "train_shell_model:main"
-casifier-audit-shell-model = "audit_shell_model:main"
 
 [tool.setuptools]
-py-modules = ["collect_opencode_cli", "build_shell_dataset", "shell_features", "train_shell_model", "audit_shell_model"]
+py-modules = ["collect_opencode_cli", "build_shell_dataset", "shell_features", "train_shell_model"]

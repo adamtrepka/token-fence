@@ -1,5 +1,8 @@
 # Token Fence
 
+[![CI](https://github.com/adamtrepka/token-fence/actions/workflows/ci.yml/badge.svg)](https://github.com/adamtrepka/token-fence/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Token Fence is an OpenCode output-risk guard backed by a small machine-learning model. It watches tool calls before execution, scores the expected output size with an ONNX model, and blocks or warns according to runtime policy.
 
 The model is trained from local OpenCode tool-call history, exported to ONNX, and loaded by the Node.js plugin at runtime. It supports shell commands and unified native-tool input features, including setup-agnostic handling for MCP-like tools.
@@ -11,7 +14,6 @@ The model is trained from local OpenCode tool-call history, exported to ONNX, an
 - `tools/train_shell_model.py` - trains and exports the ONNX model.
 - `tools/build_shell_dataset.py` - builds unified train/validation/test splits from collected OpenCode tool calls.
 - `tools/collect_opencode_cli.py` - collects local OpenCode tool-call history into JSONL.
-- `tools/audit_shell_model.py` - audits model errors and feature weights.
 
 Generated datasets and model artifacts are intentionally ignored by git. A working plugin install needs `tools/model-shell/model.onnx`, `tools/model-shell/threshold.json`, and `tools/model-shell/manifest.json` to exist locally.
 
@@ -111,7 +113,6 @@ uv sync
 uv run casifier-collect --output tool-calls.jsonl
 uv run casifier-build-dataset --input tool-calls.jsonl --output-dir dataset-shell
 uv run casifier-train-shell-model --input-dir dataset-shell --output-dir model-shell
-uv run casifier-audit-shell-model --output shell-model-audit.md
 ```
 
 `casifier-build-dataset` supports `--tool-identity hash|raw|none`. The default `hash` mode gives local personalization without putting raw MCP/native tool names into feature tokens.
@@ -123,7 +124,7 @@ Restart OpenCode after retraining so the plugin loads the new ONNX model and thr
 Check Python syntax:
 
 ```bash
-python -m py_compile tools/shell_features.py tools/train_shell_model.py tools/build_shell_dataset.py tools/audit_shell_model.py
+python -m py_compile tools/shell_features.py tools/train_shell_model.py tools/build_shell_dataset.py tools/collect_opencode_cli.py
 ```
 
 Check plugin syntax:

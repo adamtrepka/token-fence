@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 *.pyd
 .Python
+.cache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -36,16 +37,22 @@ node_modules/
 *.tsbuildinfo
 
 # Generated ML/data artifacts
+*.jsonl
+*.log
+*.zip
 *.onnx
 *.joblib
 *.pkl
 *.pickle
 *.sav
+dataset-*/
+model-*/
 
 # OpenCode / dataset outputs
 tools/.venv/
 tools/__pycache__/
 tools/*.jsonl
+tools/*.zip
 tools/*.back
 tools/shell-model-audit.*
 tools/dataset-shell/

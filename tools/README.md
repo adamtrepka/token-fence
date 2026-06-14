@@ -79,17 +79,6 @@ This produces:
 
 The manifest records the unified feature contract, including native tool identity mode, and reports metrics for all tools plus `shell` and `native` families separately.
 
-## Step 4: Audit the model
-Inspect errors and feature weights:
-
-```bash
-uv run casifier-audit-shell-model --output shell-model-audit.md
-```
-
-This writes:
-- `shell-model-audit.md`
-- `shell-model-audit.json`
-
 ## Model input
 The trainer builds a token stream from:
 - `cwd` and shell `command` for `bash` rows

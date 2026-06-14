@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: .opencode/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check OpenCode plugin
+        working-directory: .opencode
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          fi
+          if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.check ? 0 : 1)"; then
+            npm run check
+          else
+            node --check plugins/shell-guard.js
+          fi
+
+      - name: Check Python tooling syntax
+        run: python -m compileall -q -x '(^|[\/])(\.venv|__pycache__|dataset-shell|model-shell|casifier_tools\.egg-info)([\/]|$)' tools
