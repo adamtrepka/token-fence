@@ -107,6 +107,109 @@ Runtime policy:
 - Built-in edit/read/control tools such as `apply_patch`, `read`, `write`, `edit`, `glob`, `grep`, `task`, `delegate`, `question`, `todowrite`, and `skill` never block from this model; they can only warn/log.
 - Subagents are warning-only.
 
+## ML Model
+
+The runtime risk scorer is a lightweight supervised text-classification model trained on local OpenCode tool-call history.
+
+The training pipeline uses a scikit-learn pipeline:
+
+- `TfidfVectorizer` over a generated token stream.
+- Optional `SelectKBest(chi2)` feature selection via `--select-k`.
+- `LogisticRegression` classifier.
+
+Default classifier configuration:
+
+- `solver="liblinear"`
+- `class_weight="balanced"`
+- `C=2.0`
+- `max_iter=2000`
+- `random_state=42`
+
+The exported runtime artifact is ONNX (`model.onnx`). The ONNX input is a string tensor named `text`.
+
+### What The Model Predicts
+
+The model predicts whether a tool call is likely to produce large output.
+
+A row is labeled as positive / blocked when:
+
+- `total_chars >= 2000`, or
+- `total_lines >= 80`
+
+Semantically this means `large_output`, not necessarily unsafe or malicious behavior.
+
+The final block threshold is selected on the validation set using a precision-recall curve and F-beta scoring. By default `beta=2.0`, so threshold selection is recall-biased: the model prefers catching likely large-output calls over minimizing false positives.
+
+There is no separate probability calibration step beyond logistic regression probabilities and validation-based threshold selection.
+
+### Model Input Features
+
+The model does not consume raw structured objects directly. Each tool call is converted into a single token stream.
+
+For shell calls, the token stream includes:
+
+- tool family marker: `family_shell`
+- current working directory (`cwd`)
+- command tokens
+- command head / executable token
+- subcommand token when present
+- generic intent tokens, for example search, test, build, install
+- shell operators, pipes, redirects, chains, substitutions, and parentheses
+- quoted strings, parameters, paths, URLs, globs, flags, numbers, versions, UUIDs, hex values
+- bucketed aggregate features:
+  - command length
+  - line count
+  - token count
+  - chain / pipe / redirect counts
+  - substitution / parenthesis counts
+  - flag / path / URL / number / glob / quoted / parameter counts
+  - chain density
+  - cwd depth
+  - cwd contains spaces
+  - cwd has Windows drive prefix
+
+For native tool calls, the token stream includes:
+
+- tool family marker: `family_native`
+- structured JSON input shape
+- JSON character count and max depth
+- object, array, field, string, number, bool, and null counts
+- max object field count and max array length
+- string total length, max length, and line counts
+- markers for URL-like, path-like, markdown-like, code-like, JSON-like, query-like, and long-string values
+- generic value markers such as JSON, Markdown, HTML, and PDF
+- optional native tool identity:
+  - `hash` by default, using a stable hashed tool-name token
+  - `raw` for normalized raw tool-name tokens
+  - `none` to disable tool identity
+
+### Artifacts
+
+Training writes:
+
+- `tools/model-shell/model.onnx` - runtime model for the Node.js plugin
+- `tools/model-shell/model.joblib` - Python/scikit-learn model
+- `tools/model-shell/threshold.json` - selected block/warn thresholds
+- `tools/model-shell/manifest.json` - feature contract and metrics
+
+## Estimated Savings
+
+These estimates model output-token offload: how much generated tool-call output could be sent to a cheaper model when the local predictor flags high output risk. They are not guaranteed bill savings.
+
+Data source: Adam's local OpenCode history with a held-out test split. The current model was trained on 54,877 deduplicated tool calls and scored on 8,232 held-out calls. At the current threshold, it reroutes 5,488 / 8,232 calls (66.7%) and catches 2,447 / 2,557 large-output calls (~95.7% recall from current scoring). Those rerouted calls contain 25,844,405 output chars, or approximately 6,461,101 estimated output tokens, representing 94.1% of output volume in the test split.
+
+Token estimate: `output tokens ~= output chars / 4`.
+
+| Offload path | Public output-token price | Lower output-token cost | Estimated test-set savings |
+| --- | ---: | ---: | ---: |
+| Opus -> Haiku | $25/M -> $5/M | 80.0% | $129.22 |
+| Sonnet -> Haiku | $15/M -> $5/M | 66.7% | $64.61 |
+| GPT-5.5 -> GPT-5.4 mini | $30/M -> $4.50/M | 85.0% | $164.76 |
+
+Price references: current public per-token prices from [GitHub Copilot usage-based billing](https://docs.github.com/en/copilot/concepts/billing/copilot-requests), [OpenAI API pricing](https://openai.com/api/pricing/), and [Anthropic API pricing](https://www.anthropic.com/pricing), accessed 2026-06-15. Legacy Copilot premium request multipliers are not used because they only apply to old annual request-based plans.
+
+Disclaimer: these numbers are illustrative and based on one local history/test split. They count output tokens from calls predicted for rerouting; actual savings depend on runtime policy, selected models, summarization, cache, retries, and billing plan. Token count uses the chars/4 approximation, not tokenizer-exact accounting. False positives are included because the rerouting policy would send those outputs to the cheaper model too; the quality and latency trade-off must be acceptable. This is not a safety guarantee; the model predicts large-output risk.
+
 ## Retrain The Model
 
 Use the documented pipeline in `tools/README.md`. The short version is:

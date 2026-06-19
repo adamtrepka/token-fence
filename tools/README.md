@@ -80,12 +80,17 @@ This produces:
 The manifest records the unified feature contract, including native tool identity mode, and reports metrics for all tools plus `shell` and `native` families separately.
 
 ## Model input
-The trainer builds a token stream from:
-- `cwd` and shell `command` for `bash` rows
-- generic shell tokenization, command-shape tokens, command length, multiline batches, chain/pipe/redirect counts, globs, recursion, and cwd depth for shell rows
-- structured JSON input shape for native rows: depth, object/array counts, field counts, string stats, URL/path/code/markdown markers, generic value markers, and optional tool identity
-- optional feature selection via chi-square top-k filtering
-- recall-biased threshold selection by default so the model prefers catching large-output calls over being conservative
+
+The model input is a single token stream derived from shell commands or native tool JSON input. Shell features include command tokens, executable/subcommand markers, operators, flags, paths, URLs, globs, and bucketed aggregate counts. Native-tool features include JSON shape, value-type counts, string/path/URL-like markers, and optional tool identity (`hash`, `raw`, or `none`).
+
+## Artifacts
+
+Training writes:
+
+- `model-shell/model.onnx` - runtime model for the Node.js plugin
+- `model-shell/model.joblib` - Python/scikit-learn model
+- `model-shell/threshold.json` - selected block/warn thresholds
+- `model-shell/manifest.json` - feature contract and metrics
 
 ## Notes
 - Generated datasets and models are ignored by git.
