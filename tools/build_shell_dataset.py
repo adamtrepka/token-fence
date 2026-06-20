@@ -66,6 +66,20 @@ CHAR_BUCKETS = [
     (MAX_BUCKET, "32001_plus"),
 ]
 DEPTH_BUCKETS = [(0, "0"), (1, "1"), (2, "2"), (4, "3_4"), (8, "5_8"), (MAX_BUCKET, "9_plus")]
+FIELD_NAME_LIMIT = 48
+FIELD_NAME_TOKEN_LIMIT = 40
+FIELD_LIMIT_VALUE_BUCKETS = [(10, "1_10"), (100, "11_100"), (1000, "101_1000"), (MAX_BUCKET, "1001_plus")]
+
+FIELD_CLASS_HINTS = {
+    "field_output_limit": {"limit", "max", "results", "first", "last", "tail", "count", "top", "take"},
+    "field_pagination": {"offset", "page", "cursor", "token"},
+    "field_path": {"path", "file", "directory", "dir", "glob", "pattern", "include", "exclude"},
+    "field_query": {"query", "search", "filter"},
+    "field_url": {"url", "uri", "link"},
+    "field_format": {"format", "json", "yaml", "xml", "output", "mime", "type"},
+    "field_provider": {"provider", "model", "engine", "tool"},
+    "field_temperature": {"temperature"},
+}
 
 
 @dataclass(frozen=True)
@@ -229,6 +243,28 @@ def normalize_identifier(value: str) -> str:
     return normalized[:80] or "empty"
 
 
+def normalize_feature_name(value: str, max_len: int = FIELD_NAME_LIMIT) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return normalized[:max_len] or "empty"
+
+
+def field_classes_for_name(name: str) -> list[str]:
+    normalized = normalize_feature_name(name)
+    parts = set(normalized.split("_"))
+    classes = [label for label, hints in FIELD_CLASS_HINTS.items() if parts & hints or normalized in hints]
+    return classes
+
+
+def is_limit_like_field(name: str) -> bool:
+    normalized = normalize_feature_name(name)
+    parts = set(normalized.split("_"))
+    return bool(parts & FIELD_CLASS_HINTS["field_output_limit"] or normalized.endswith("limit") or normalized.endswith("count"))
+
+
+def field_limit_bucket(value: int) -> str:
+    return bucket_token("field_limit_value", abs(int(value)), FIELD_LIMIT_VALUE_BUCKETS)
+
+
 def tool_identity_feature(tool: str, mode: str) -> str | None:
     if mode == "none" or not tool:
         return None
@@ -282,6 +318,9 @@ def empty_native_stats() -> dict[str, object]:
         "long_string_count": 0,
         "query_like_count": 0,
         "query_word_max": 0,
+        "field_names": set(),
+        "field_classes": set(),
+        "field_limit_values": set(),
         "value_markers": set(),
     }
 
@@ -324,7 +363,13 @@ def walk_native_input(value: object, stats: dict[str, object], depth: int = 0) -
         stats["object_count"] = int(stats["object_count"]) + 1
         stats["field_count"] = int(stats["field_count"]) + len(value)
         stats["max_object_fields"] = max(int(stats["max_object_fields"]), len(value))
-        for item in value.values():
+        for key, item in value.items():
+            if len(stats["field_names"]) < FIELD_NAME_TOKEN_LIMIT:
+                stats["field_names"].add(normalize_feature_name(str(key)))  # type: ignore[union-attr]
+            if isinstance(item, int | float) and not isinstance(item, bool) and is_limit_like_field(str(key)):
+                stats["field_limit_values"].add(field_limit_bucket(int(item)))  # type: ignore[union-attr]
+            for label in field_classes_for_name(str(key)):
+                stats["field_classes"].add(label)  # type: ignore[union-attr]
             walk_native_input(item, stats, depth + 1)
         return
 
@@ -385,6 +430,12 @@ def native_tokens(stats: dict[str, object], identity: str | None) -> list[str]:
         tokens.append(bucket_token(field, int(stats[field]), CHAR_BUCKETS))
     for marker in sorted(stats["value_markers"]):
         tokens.append(f"value_marker_{marker}")
+    for field_name in sorted(stats["field_names"]):
+        tokens.append(f"field_name_{field_name}")
+    for label in sorted(stats["field_classes"]):
+        tokens.append(label)
+    for token in sorted(stats["field_limit_values"]):
+        tokens.append(token)
     return tokens
 
 
@@ -395,6 +446,9 @@ def native_input_features(input_raw: object, tool: str, tool_identity: str) -> d
 
     identity = tool_identity_feature(tool, tool_identity)
     tokens = native_tokens(stats, identity)
+    stats["field_names"] = sorted(stats["field_names"])
+    stats["field_classes"] = sorted(stats["field_classes"])
+    stats["field_limit_values"] = sorted(stats["field_limit_values"])
     stats["value_markers"] = sorted(stats["value_markers"])
 
     return {

@@ -101,6 +101,26 @@ const CWD_DEPTH_BUCKETS = [
   [7, "5_7"],
   [MAX_BUCKET, "8_plus"],
 ];
+const OUTPUT_LIMITER_SIZE_BUCKETS = [[10, "1_10"], [100, "11_100"], [1000, "101_1000"], [MAX_BUCKET, "1001_plus"]];
+const FLAG_NAME_MAX_LEN = 48;
+const NUMERIC_VALUE_BUCKETS = [[0, "0"], [10, "1_10"], [100, "11_100"], [1000, "101_1000"], [MAX_BUCKET, "1001_plus"]];
+const LIMITER_FLAG_HINTS = new Set(["limit", "max", "max_count", "max_results", "max_items", "page_size", "first", "last", "tail", "count", "top", "take"]);
+const QUIET_FLAG_HINTS = new Set(["quiet", "silent", "no_progress", "terse"]);
+const EXPANDER_FLAG_HINTS = new Set(["verbose", "debug", "trace", "all", "recursive", "recurse", "paginate", "follow"]);
+const FORMAT_FLAG_HINTS = new Set(["json", "yaml", "xml", "format", "output"]);
+const FIELD_NAME_LIMIT = 48;
+const FIELD_NAME_TOKEN_LIMIT = 40;
+const FIELD_LIMIT_VALUE_BUCKETS = [[10, "1_10"], [100, "11_100"], [1000, "101_1000"], [MAX_BUCKET, "1001_plus"]];
+const FIELD_CLASS_HINTS = {
+  field_output_limit: new Set(["limit", "max", "results", "first", "last", "tail", "count", "top", "take"]),
+  field_pagination: new Set(["offset", "page", "cursor", "token"]),
+  field_path: new Set(["path", "file", "directory", "dir", "glob", "pattern", "include", "exclude"]),
+  field_query: new Set(["query", "search", "filter"]),
+  field_url: new Set(["url", "uri", "link"]),
+  field_format: new Set(["format", "json", "yaml", "xml", "output", "mime", "type"]),
+  field_provider: new Set(["provider", "model", "engine", "tool"]),
+  field_temperature: new Set(["temperature"]),
+};
 
 const NATIVE_COUNT_BUCKETS = [[0, "0"], [1, "1"], [2, "2"], [5, "3_5"], [10, "6_10"], [25, "11_25"], [50, "26_50"], [100, "51_100"], [250, "101_250"], [MAX_BUCKET, "251_plus"]];
 const NATIVE_CHAR_BUCKETS = [[0, "0"], [80, "1_80"], [240, "81_240"], [800, "241_800"], [2000, "801_2000"], [8000, "2001_8000"], [32000, "8001_32000"], [MAX_BUCKET, "32001_plus"]];
@@ -110,6 +130,7 @@ const PATH_EXTENSION_RE = /\.[A-Za-z0-9]{1,10}(?:$|[?#])/;
 const MARKDOWN_VALUE_RE = /(^|\n)\s{0,3}(?:#{1,6}\s|[-*+]\s|\d+\.\s|```|>)/;
 const CODE_VALUE_RE = /```|=>|[{};]|\b(?:class|def|function|import|select|from|where)\b/i;
 const GENERIC_VALUE_MARKERS = new Set(["bm25", "csv", "fit", "html", "json", "llm", "markdown", "md", "pdf", "png", "raw", "svg", "text", "xml", "yaml"]);
+const OUTPUT_LIMITER_SILENT_SHORT_HEADS = new Set(["curl", "npm"]);
 const NEVER_BLOCK_NATIVE_TOOLS = new Set([
   "apply_patch",
   "delegate",
@@ -230,7 +251,7 @@ function classifyToken(token) {
   if (token === "param_expansion") return ["param_expansion"];
   if (lowered.startsWith("-")) {
     if (lowered.startsWith("--")) return ["flag_long", "flag"];
-    if (lowered.length > 2 && /[a-z]/i.test(lowered[1])) return ["flag_short_group", "flag"];
+    if (lowered.length > 2 && /[a-z]/i.test(lowered[1]) && looksLikeShortFlagGroup(lowered.slice(1))) return ["flag_short_group", "flag"];
     return ["flag", "flag_short"];
   }
   if (URL_RE.test(token)) return ["url"];
@@ -291,6 +312,164 @@ function appendBucketToken(classified, prefix, value, buckets) {
   classified.push(bucketTokens(prefix, value, buckets));
 }
 
+function integerFromToken(token) {
+  const stripped = stripQuotes(String(token || "").trim());
+  return /^\d+$/.test(stripped) ? Number(stripped) : null;
+}
+
+function flagValue(token, flag) {
+  const lowered = String(token || "").toLowerCase();
+  const flagLower = String(flag || "").toLowerCase();
+  if (lowered.startsWith(`${flagLower}=`)) {
+    return integerFromToken(String(token).slice(flag.length + 1));
+  }
+  if (lowered.startsWith(flagLower) && String(token).length > flag.length) {
+    return integerFromToken(String(token).slice(flag.length));
+  }
+  return null;
+}
+
+function appendUnique(classified, seen, token) {
+  if (token && !seen.has(token)) {
+    seen.add(token);
+    classified.push(token);
+  }
+}
+
+function outputLimiterFeatures(rawTokens, head, subcmd) {
+  const classified = [];
+  const seen = new Set();
+  const add = (token) => appendUnique(classified, seen, token);
+
+  if (head === "head") {
+    add("output_limiter_present");
+    add("output_limiter_head");
+  } else if (head === "tail") {
+    add("output_limiter_present");
+    add("output_limiter_tail");
+  }
+
+  if (head === "select-object" && rawTokens.some((token) => ["-first", "--first"].includes(String(token).toLowerCase()))) {
+    add("output_limiter_present");
+    add("output_limiter_select_first");
+  }
+
+  if (head === "git" && subcmd === "log") {
+    add("output_limiter_present");
+    rawTokens.forEach((token, index) => {
+      let value = flagValue(token, "-n");
+      if (value === null && String(token).toLowerCase() === "-n" && index + 1 < rawTokens.length) {
+        value = integerFromToken(rawTokens[index + 1]);
+      }
+      if (value !== null) {
+        add("output_limiter_max_count");
+        add(bucketTokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    });
+  }
+
+  if ((head === "docker" || head === "kubectl") && subcmd === "logs") {
+    add("output_limiter_present");
+    rawTokens.forEach((token, index) => {
+      let value = flagValue(token, "--tail");
+      if (value === null && String(token).toLowerCase() === "--tail" && index + 1 < rawTokens.length) {
+        value = integerFromToken(rawTokens[index + 1]);
+      }
+      if (value !== null) {
+        add("output_limiter_tail_flag");
+        add(bucketTokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    });
+  }
+
+  if (head === "rg") {
+    let foundLimiter = false;
+    rawTokens.forEach((token, index) => {
+      const lowered = String(token).toLowerCase();
+      let value = flagValue(token, "-m");
+      if (value === null && ["-m", "--max-count"].includes(lowered) && index + 1 < rawTokens.length) {
+        value = integerFromToken(rawTokens[index + 1]);
+      }
+      if (value === null && lowered.startsWith("--max-count=")) {
+        value = integerFromToken(String(token).split("=", 2)[1]);
+      }
+      if (value !== null) {
+        foundLimiter = true;
+        add("output_limiter_max_count");
+        add(bucketTokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    });
+    if (foundLimiter) {
+      add("output_limiter_present");
+    }
+  }
+
+  rawTokens.forEach((token, index) => {
+    const lowered = String(token).toLowerCase();
+    if (["--quiet", "-q"].includes(lowered)) {
+      add("output_quiet_flag");
+      add("output_limiter_present");
+    } else if (lowered === "--silent") {
+      add("output_silent_flag");
+      add("output_limiter_present");
+    } else if (lowered === "-s" && OUTPUT_LIMITER_SILENT_SHORT_HEADS.has(head)) {
+      add("output_silent_short_flag");
+      add("output_limiter_present");
+    }
+
+    if (lowered === "-first" && head === "select-object" && index + 1 < rawTokens.length) {
+      const value = integerFromToken(rawTokens[index + 1]);
+      if (value !== null) {
+        add("output_limiter_present");
+        add("output_limiter_select_first");
+        add(bucketTokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    }
+
+    if ((head === "head" || head === "tail") && lowered === "-n" && index + 1 < rawTokens.length) {
+      const value = integerFromToken(rawTokens[index + 1]);
+      if (value !== null) {
+        add(bucketTokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    }
+
+    if ((head === "head" || head === "tail") && lowered.startsWith("-n")) {
+      const value = flagValue(token, "-n");
+      if (value !== null) {
+        add(bucketTokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    }
+  });
+
+  return classified;
+}
+
+function numericFieldBucket(value) {
+  return bucketTokens("field_limit_value", Math.abs(Number(value) || 0), FIELD_LIMIT_VALUE_BUCKETS);
+}
+
+function normalizeFieldName(value, maxLen = FIELD_NAME_LIMIT) {
+  return normalizeFeatureName(value, maxLen);
+}
+
+function fieldClassesForName(name) {
+  const normalized = normalizeFieldName(name);
+  const parts = new Set(normalized.split("_").filter(Boolean));
+  const classes = [];
+  for (const [label, hints] of Object.entries(FIELD_CLASS_HINTS)) {
+    if ([...parts].some((part) => hints.has(part)) || hints.has(normalized)) {
+      classes.push(label);
+    }
+  }
+  return classes;
+}
+
+function isLimitLikeField(name) {
+  const normalized = normalizeFieldName(name);
+  const parts = new Set(normalized.split("_").filter(Boolean));
+  return [...parts].some((part) => FIELD_CLASS_HINTS.field_output_limit.has(part)) || normalized.endsWith("limit") || normalized.endsWith("count");
+}
+
 function buildModelText(command, workdir = "") {
   const rawTokens = shellishTokens(command);
   const classified = [];
@@ -335,6 +514,9 @@ function buildModelText(command, workdir = "") {
       classified.push(`intent_${token}`);
     }
   }
+
+  classified.push(...outputLimiterFeatures(rawTokens, head, subcmd));
+  classified.push(...flagFeatures(rawTokens));
 
   appendBucketToken(classified, "command_char_count", String(command || "").length, COMMAND_CHAR_BUCKETS);
   appendBucketToken(classified, "command_line_count", (String(command || "").match(/\n/g) || []).length + (String(command || "").trim() ? 1 : 0), COMMAND_LINE_BUCKETS);
@@ -395,6 +577,148 @@ function normalizeIdentifier(value) {
   return (normalized || "empty").slice(0, 80);
 }
 
+function normalizeFeatureName(value, maxLen = FLAG_NAME_MAX_LEN) {
+  const normalized = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return (normalized || "empty").slice(0, maxLen);
+}
+
+function flagValueBucket(value) {
+  return bucketTokens("flag_numeric_value", Math.abs(Number(value) || 0), NUMERIC_VALUE_BUCKETS);
+}
+
+function looksLikeShortFlagGroup(body) {
+  return /^[A-Za-z]{2,3}$/.test(body) && !/[aeiouy]/i.test(body);
+}
+
+function looksLikeAttachedShortValue(body) {
+  return body.length > 1 && /^[A-Za-z]/.test(body[0]) && !/^\d+$/.test(body.slice(1));
+}
+
+function flagControlTokens(normalized) {
+  const parts = new Set(String(normalized || "").split("_").filter(Boolean));
+  const tokens = [];
+  if (LIMITER_FLAG_HINTS.has(normalized) || [...parts].some((part) => LIMITER_FLAG_HINTS.has(part))) {
+    tokens.push("output_limit_flag", "output_limiter_present");
+  }
+  if (QUIET_FLAG_HINTS.has(normalized) || [...parts].some((part) => QUIET_FLAG_HINTS.has(part))) {
+    tokens.push("output_quiet_flag", "output_limiter_present");
+    if (parts.has("silent")) tokens.push("output_silent_flag");
+  }
+  if (EXPANDER_FLAG_HINTS.has(normalized) || [...parts].some((part) => EXPANDER_FLAG_HINTS.has(part))) {
+    tokens.push("output_expander_flag");
+  }
+  if (FORMAT_FLAG_HINTS.has(normalized) || [...parts].some((part) => FORMAT_FLAG_HINTS.has(part))) {
+    tokens.push("output_format_flag");
+    if (["json", "yaml", "xml", "format", "output"].includes(normalized)) tokens.push("output_structured_output_flag");
+  }
+  if (normalized === "output" || normalized.includes("structured_output")) {
+    tokens.push("output_structured_output_flag");
+  }
+  return tokens;
+}
+
+function flagNumericValue(rawTokens, index, token, flagName) {
+  const lowered = String(token || "").toLowerCase();
+  const flagLower = String(flagName || "").toLowerCase();
+  if (lowered.startsWith(`${flagLower}=`) || lowered.startsWith(`${flagLower}:`)) {
+    return integerFromToken(String(token).slice(flagName.length + 1));
+  }
+  if (lowered === flagLower && index + 1 < rawTokens.length) {
+    return integerFromToken(rawTokens[index + 1]);
+  }
+  return null;
+}
+
+function flagFeatures(rawTokens) {
+  const features = [];
+  const seen = new Set();
+  const add = (token) => appendUnique(features, seen, token);
+
+  rawTokens.forEach((token, index) => {
+    const stripped = stripQuotes(String(token || "")).trim();
+    if (!stripped.startsWith("-") || stripped === "-" || stripped === "--") return;
+
+    const lowered = stripped.toLowerCase();
+    if (lowered.startsWith("--")) {
+      const flagName = stripped.slice(2).split(/[=:]/, 1)[0];
+      const normalized = normalizeFeatureName(flagName);
+      add(`flag_name_${normalized}`);
+      add("flag_long");
+      add("flag");
+      for (const extra of flagControlTokens(normalized)) add(extra);
+      const value = flagNumericValue(rawTokens, index, stripped, `--${flagName}`);
+      if (value !== null) {
+        add(flagValueBucket(value));
+        if (seen.has("output_limit_flag") || seen.has("output_limiter_present")) {
+          add(bucketTokens("output_limiter_size", Math.abs(Number(value) || 0), OUTPUT_LIMITER_SIZE_BUCKETS));
+        }
+      }
+      return;
+    }
+
+    const body = stripped.slice(1);
+    if (body.length === 1) {
+      const short = body.toLowerCase();
+      add(`flag_short_${short}`);
+      add("flag");
+      add("flag_short");
+      if (short === "q") add("output_quiet_flag");
+      else if (short === "v") add("output_expander_flag");
+      const value = short === "n" ? integerFromToken(rawTokens[index + 1]) : null;
+      if (value !== null) add(flagValueBucket(value));
+      return;
+    }
+
+    if (looksLikeShortFlagGroup(body)) {
+      add("flag_short_group");
+      add("flag");
+      for (const short of body.toLowerCase()) {
+        add(`flag_short_${short}`);
+        if (short === "q") add("output_quiet_flag");
+        else if (short === "v") add("output_expander_flag");
+      }
+      return;
+    }
+
+    if (looksLikeAttachedShortValue(body)) {
+      const short = body[0].toLowerCase();
+      add(`flag_short_${short}`);
+      add("flag");
+      add("flag_short");
+      return;
+    }
+
+    const shortMatch = body.match(/^([A-Za-z])(?:=)?([+-]?\d+)$/);
+    if (shortMatch) {
+      const short = shortMatch[1].toLowerCase();
+      const value = integerFromToken(shortMatch[2]);
+      add(`flag_short_${short}`);
+      add("flag");
+      add("flag_short");
+      if (short === "q") add("output_quiet_flag");
+      else if (short === "v") add("output_expander_flag");
+      if (value !== null) add(flagValueBucket(value));
+      return;
+    }
+
+    const flagName = body.split(/[=:]/, 1)[0];
+    const normalized = normalizeFeatureName(flagName);
+    add(`flag_name_${normalized}`);
+    add("flag_long");
+    add("flag");
+    for (const extra of flagControlTokens(normalized)) add(extra);
+    const value = flagNumericValue(rawTokens, index, stripped, `-${flagName}`);
+    if (value !== null) {
+      add(flagValueBucket(value));
+      if (seen.has("output_limit_flag") || seen.has("output_limiter_present")) {
+        add(bucketTokens("output_limiter_size", Math.abs(Number(value) || 0), OUTPUT_LIMITER_SIZE_BUCKETS));
+      }
+    }
+  });
+
+  return features;
+}
+
 function toolIdentityFeature(tool, mode) {
   if (mode === "none" || !tool) return null;
   if (mode === "raw") return `tool_raw_${normalizeIdentifier(tool)}`;
@@ -437,6 +761,9 @@ function emptyNativeStats() {
     long_string_count: 0,
     query_like_count: 0,
     query_word_max: 0,
+    field_names: new Set(),
+    field_classes: new Set(),
+    field_limit_values: new Set(),
     value_markers: new Set(),
   };
 }
@@ -479,11 +806,16 @@ function walkNativeInput(value, stats, depth = 0) {
   }
 
   if (value && typeof value === "object") {
-    const values = Object.values(value);
+    const entries = Object.entries(value);
     stats.object_count += 1;
-    stats.field_count += values.length;
-    stats.max_object_fields = Math.max(stats.max_object_fields, values.length);
-    for (const item of values) walkNativeInput(item, stats, depth + 1);
+    stats.field_count += entries.length;
+    stats.max_object_fields = Math.max(stats.max_object_fields, entries.length);
+    for (const [key, item] of entries) {
+      if (stats.field_names.size < FIELD_NAME_TOKEN_LIMIT) stats.field_names.add(normalizeFieldName(key));
+      for (const label of fieldClassesForName(key)) stats.field_classes.add(label);
+      if (typeof item === "number" && Number.isFinite(item) && isLimitLikeField(key)) stats.field_limit_values.add(numericFieldBucket(item));
+      walkNativeInput(item, stats, depth + 1);
+    }
     return;
   }
 
@@ -542,6 +874,15 @@ function nativeTokens(stats, identity) {
   }
   for (const marker of Array.from(stats.value_markers).sort()) {
     tokens.push(`value_marker_${marker}`);
+  }
+  for (const fieldName of Array.from(stats.field_names).sort()) {
+    tokens.push(`field_name_${fieldName}`);
+  }
+  for (const label of Array.from(stats.field_classes).sort()) {
+    tokens.push(label);
+  }
+  for (const token of Array.from(stats.field_limit_values).sort()) {
+    tokens.push(token);
   }
   return tokens;
 }

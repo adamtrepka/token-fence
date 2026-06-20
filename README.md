@@ -156,6 +156,8 @@ For shell calls, the token stream includes:
 - generic intent tokens, for example search, test, build, install
 - shell operators, pipes, redirects, chains, substitutions, and parentheses
 - quoted strings, parameters, paths, URLs, globs, flags, numbers, versions, UUIDs, hex values
+- output-limiting / quieting cues such as `--quiet`, `--silent`, `head -n`, `tail -n`, `Select-Object -First`, `git log -n`, `--tail`, and `-m/--max-count`
+- generic flag-name and short-flag tokens, plus bucketed numeric flag values
 - bucketed aggregate features:
   - command length
   - line count
@@ -178,6 +180,7 @@ For native tool calls, the token stream includes:
 - string total length, max length, and line counts
 - markers for URL-like, path-like, markdown-like, code-like, JSON-like, query-like, and long-string values
 - generic value markers such as JSON, Markdown, HTML, and PDF
+- capped field-name tokens, field class tokens, and bucketed limit values for structured inputs
 - optional native tool identity:
   - `hash` by default, using a stable hashed tool-name token
   - `raw` for normalized raw tool-name tokens

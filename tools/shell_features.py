@@ -106,6 +106,14 @@ CWD_DEPTH_BUCKETS: CountBuckets = [
     (7, "5_7"),
     (MAX_BUCKET, "8_plus"),
 ]
+OUTPUT_LIMITER_SIZE_BUCKETS: CountBuckets = [(10, "1_10"), (100, "11_100"), (1000, "101_1000"), (MAX_BUCKET, "1001_plus")]
+FLAG_NAME_MAX_LEN = 48
+NUMERIC_VALUE_BUCKETS: CountBuckets = [(0, "0"), (10, "1_10"), (100, "11_100"), (1000, "101_1000"), (MAX_BUCKET, "1001_plus")]
+
+LIMITER_FLAG_HINTS = {"limit", "max", "max_count", "max_results", "max_items", "page_size", "first", "last", "tail", "count", "top", "take"}
+QUIET_FLAG_HINTS = {"quiet", "silent", "no_progress", "terse"}
+EXPANDER_FLAG_HINTS = {"verbose", "debug", "trace", "all", "recursive", "recurse", "paginate", "follow"}
+FORMAT_FLAG_HINTS = {"json", "yaml", "xml", "format", "output"}
 
 
 COUNT_KEYS = (
@@ -124,6 +132,269 @@ COUNT_KEYS = (
     "redirect",
     "paren",
 )
+
+OUTPUT_LIMITER_SILENT_SHORT_HEADS = {"curl", "npm"}
+
+
+def _int_from_token(token: str) -> int | None:
+    stripped = _strip_quotes(token).strip()
+    if re.fullmatch(r"\d+", stripped):
+        return int(stripped)
+    return None
+
+
+def _flag_value(token: str, flag: str) -> int | None:
+    lowered = token.lower()
+    flag_lower = flag.lower()
+    if lowered.startswith(f"{flag_lower}="):
+        return _int_from_token(token[len(flag) + 1 :])
+    if lowered.startswith(flag_lower) and len(token) > len(flag):
+        return _int_from_token(token[len(flag) :])
+    return None
+
+
+def _append_unique(tokens: list[str], seen: set[str], token: str) -> None:
+    if token and token not in seen:
+        seen.add(token)
+        tokens.append(token)
+
+
+def _normalize_feature_name(value: str, max_len: int = FLAG_NAME_MAX_LEN) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    normalized = normalized[:max_len]
+    return normalized or "empty"
+
+
+def _flag_value_bucket(value: int) -> str:
+    return _bucket_tokens("flag_numeric_value", abs(int(value)), NUMERIC_VALUE_BUCKETS)
+
+
+def _looks_like_short_flag_group(body: str) -> bool:
+    return bool(
+        body.isalpha()
+        and 2 <= len(body) <= 3
+        and not re.search(r"[aeiouy]", body, re.I)
+    )
+
+
+def _looks_like_attached_short_value(body: str) -> bool:
+    return bool(len(body) > 1 and body[0].isalpha() and not body[1:].isdigit())
+
+
+def _flag_control_tokens(normalized: str) -> list[str]:
+    tokens: list[str] = []
+    parts = set(normalized.split("_"))
+
+    def matches(hints: set[str]) -> bool:
+        return bool(parts & hints or normalized in hints)
+
+    if matches(LIMITER_FLAG_HINTS):
+        tokens.append("output_limit_flag")
+        tokens.append("output_limiter_present")
+    if matches(QUIET_FLAG_HINTS):
+        tokens.append("output_quiet_flag")
+        if "silent" in parts:
+            tokens.append("output_silent_flag")
+        tokens.append("output_limiter_present")
+    if matches(EXPANDER_FLAG_HINTS):
+        tokens.append("output_expander_flag")
+    if matches(FORMAT_FLAG_HINTS):
+        tokens.append("output_format_flag")
+        if normalized in {"json", "yaml", "xml", "format", "output"}:
+            tokens.append("output_structured_output_flag")
+    if normalized == "output" or "structured_output" in normalized:
+        tokens.append("output_structured_output_flag")
+    return tokens
+
+
+def _flag_numeric_value(raw_tokens: list[str], index: int, token: str, flag_name: str) -> int | None:
+    lowered = token.lower()
+    flag_lower = flag_name.lower()
+    if lowered.startswith(f"{flag_lower}="):
+        return _int_from_token(token[len(flag_name) + 1 :])
+    if lowered.startswith(f"{flag_lower}:"):
+        return _int_from_token(token[len(flag_name) + 1 :])
+    if lowered == flag_lower and index + 1 < len(raw_tokens):
+        return _int_from_token(raw_tokens[index + 1])
+    return None
+
+
+def flag_features(raw_tokens: list[str]) -> list[str]:
+    features: list[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        _append_unique(features, seen, token)
+
+    for index, token in enumerate(raw_tokens):
+        stripped = _strip_quotes(token).strip()
+        if not stripped.startswith("-") or stripped in {"-", "--"}:
+            continue
+
+        lowered = stripped.lower()
+        if lowered.startswith("--"):
+            flag_name = re.split(r"[=:]", stripped[2:], 1)[0]
+            normalized = _normalize_feature_name(flag_name)
+            add(f"flag_name_{normalized}")
+            add("flag_long")
+            add("flag")
+            for extra in _flag_control_tokens(normalized):
+                add(extra)
+            value = _flag_numeric_value(raw_tokens, index, stripped, f"--{flag_name}")
+            if value is not None:
+                add(_flag_value_bucket(value))
+                if "output_limit_flag" in features or "output_limiter_present" in features:
+                    add(_bucket_tokens("output_limiter_size", abs(int(value)), OUTPUT_LIMITER_SIZE_BUCKETS))
+            continue
+
+        body = stripped[1:]
+        if len(body) == 1:
+            short = body.lower()
+            add(f"flag_short_{short}")
+            add("flag")
+            add("flag_short")
+            if short == "q":
+                add("output_quiet_flag")
+            elif short == "v":
+                add("output_expander_flag")
+            value = _int_from_token(raw_tokens[index + 1]) if index + 1 < len(raw_tokens) else None
+            if value is not None and short == "n":
+                add(_flag_value_bucket(value))
+            continue
+
+        if _looks_like_short_flag_group(body):
+            add("flag_short_group")
+            add("flag")
+            for short in body.lower():
+                add(f"flag_short_{short}")
+                if short == "q":
+                    add("output_quiet_flag")
+                elif short == "v":
+                    add("output_expander_flag")
+            continue
+
+        if _looks_like_attached_short_value(body):
+            short = body[0].lower()
+            add(f"flag_short_{short}")
+            add("flag")
+            add("flag_short")
+            continue
+
+        short_match = re.fullmatch(r"([A-Za-z])(?:=)?([+-]?\d+)", body)
+        if short_match:
+            short = short_match.group(1).lower()
+            value = _int_from_token(short_match.group(2))
+            add(f"flag_short_{short}")
+            add("flag")
+            add("flag_short")
+            if short == "q":
+                add("output_quiet_flag")
+            elif short == "v":
+                add("output_expander_flag")
+            if value is not None:
+                add(_flag_value_bucket(value))
+            continue
+
+        flag_name = re.split(r"[=:]", body, 1)[0]
+        normalized = _normalize_feature_name(flag_name)
+        add(f"flag_name_{normalized}")
+        add("flag_long")
+        add("flag")
+        for extra in _flag_control_tokens(normalized):
+            add(extra)
+        value = _flag_numeric_value(raw_tokens, index, stripped, f"-{flag_name}")
+        if value is not None:
+            add(_flag_value_bucket(value))
+            if "output_limit_flag" in features or "output_limiter_present" in features:
+                add(_bucket_tokens("output_limiter_size", abs(int(value)), OUTPUT_LIMITER_SIZE_BUCKETS))
+
+    return features
+
+
+def output_limiter_features(raw_tokens: list[str], head: str, subcmd: str) -> list[str]:
+    features: list[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        _append_unique(features, seen, token)
+
+    if head == "head":
+        add("output_limiter_present")
+        add("output_limiter_head")
+    elif head == "tail":
+        add("output_limiter_present")
+        add("output_limiter_tail")
+
+    if head == "select-object" and any(token.lower() in {"-first", "--first"} for token in raw_tokens):
+        add("output_limiter_present")
+        add("output_limiter_select_first")
+
+    if head == "git" and subcmd == "log":
+        add("output_limiter_present")
+        for index, token in enumerate(raw_tokens):
+            value = _flag_value(token, "-n")
+            if value is None and token.lower() == "-n" and index + 1 < len(raw_tokens):
+                value = _int_from_token(raw_tokens[index + 1])
+            if value is not None:
+                add("output_limiter_max_count")
+                add(_bucket_tokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS))
+
+    if head in {"docker", "kubectl"} and subcmd == "logs":
+        add("output_limiter_present")
+        for index, token in enumerate(raw_tokens):
+            value = _flag_value(token, "--tail")
+            if value is None and token.lower() == "--tail" and index + 1 < len(raw_tokens):
+                value = _int_from_token(raw_tokens[index + 1])
+            if value is not None:
+                add("output_limiter_tail_flag")
+                add(_bucket_tokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS))
+
+    if head == "rg":
+        found_limiter = False
+        for index, token in enumerate(raw_tokens):
+            lowered = token.lower()
+            value = _flag_value(token, "-m")
+            if value is None and lowered in {"-m", "--max-count"} and index + 1 < len(raw_tokens):
+                value = _int_from_token(raw_tokens[index + 1])
+            if value is None and lowered.startswith("--max-count="):
+                value = _int_from_token(token.split("=", 1)[1])
+            if value is not None:
+                found_limiter = True
+                add("output_limiter_max_count")
+                add(_bucket_tokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS))
+        if found_limiter:
+            add("output_limiter_present")
+
+    for index, token in enumerate(raw_tokens):
+        lowered = token.lower()
+        if lowered in {"--quiet", "-q"}:
+            add("output_quiet_flag")
+            add("output_limiter_present")
+        elif lowered == "--silent":
+            add("output_silent_flag")
+            add("output_limiter_present")
+        elif lowered == "-s" and head in OUTPUT_LIMITER_SILENT_SHORT_HEADS:
+            add("output_silent_short_flag")
+            add("output_limiter_present")
+
+        if lowered == "-first" and head == "select-object" and index + 1 < len(raw_tokens):
+            value = _int_from_token(raw_tokens[index + 1])
+            if value is not None:
+                add("output_limiter_present")
+                add("output_limiter_select_first")
+                add(_bucket_tokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS))
+
+        if head in {"head", "tail"} and lowered == "-n" and index + 1 < len(raw_tokens):
+            value = _int_from_token(raw_tokens[index + 1])
+            if value is not None:
+                add(_bucket_tokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS))
+
+        if head in {"head", "tail"} and lowered.startswith("-n"):
+            value = _flag_value(token, "-n")
+            if value is not None:
+                add(_bucket_tokens("output_limiter_size", value, OUTPUT_LIMITER_SIZE_BUCKETS))
+
+    return features
 
 def _strip_quotes(token: str) -> str:
     return token.strip('"\'`')
@@ -226,7 +497,7 @@ def classify_token(token: str) -> list[str]:
     if lowered.startswith("-"):
         if lowered.startswith("--"):
             return ["flag_long", "flag"]
-        if len(lowered) > 2 and lowered[1].isalpha():
+        if len(lowered) > 2 and lowered[1].isalpha() and _looks_like_short_flag_group(lowered[1:]):
             return ["flag_short_group", "flag"]
         return ["flag", "flag_short"]
     if URL_RE.match(token):
@@ -333,6 +604,9 @@ def build_model_text(command: str, workdir: str = "") -> str:
     for token in {head, subcmd}:
         if token in GENERIC_INTENTS:
             classified.append(f"intent_{token}")
+
+    classified.extend(output_limiter_features(raw_tokens, head, subcmd))
+    classified.extend(flag_features(raw_tokens))
 
     _append_count_bucket(classified, "command_char_count", len(command), COMMAND_CHAR_BUCKETS)
     _append_count_bucket(classified, "command_line_count", command.count("\n") + (1 if command.strip() else 0), COMMAND_LINE_BUCKETS)

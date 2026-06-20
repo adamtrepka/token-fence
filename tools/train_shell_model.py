@@ -32,6 +32,22 @@ from shell_features import build_model_text
 DEFAULT_INPUT_DIR = Path("dataset-shell")
 DEFAULT_OUTPUT_DIR = Path("model-shell")
 WARN_THRESHOLD_FLOOR = 0.05
+NEVER_BLOCK_NATIVE_TOOLS = {
+    "apply_patch",
+    "delegate",
+    "delegation_list",
+    "delegation_read",
+    "edit",
+    "glob",
+    "grep",
+    "multi_tool_use.parallel",
+    "question",
+    "read",
+    "skill",
+    "task",
+    "todowrite",
+    "write",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,6 +195,64 @@ def get_family(row: dict[str, object]) -> str:
     if isinstance(family, str) and family.strip():
         return family.strip()
     return "unknown"
+
+
+def normalize_tool_name(tool: object) -> str:
+    return str(tool or "").strip().lower().removeprefix("functions.")
+
+
+def is_never_block_native_tool(tool: object) -> bool:
+    return normalize_tool_name(tool) in NEVER_BLOCK_NATIVE_TOOLS
+
+
+def is_runtime_block_capable(row: dict[str, object]) -> bool:
+    family = get_family(row)
+    if family == "shell":
+        return True
+    if family == "native":
+        return not is_never_block_native_tool(row.get("tool"))
+    return False
+
+
+def evaluate_rows(rows: list[dict[str, object]], y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[str, object]:
+    if len(y_true) == 0:
+        return {
+            "threshold": float(threshold),
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "accuracy": 0.0,
+            "roc_auc": None,
+            "average_precision": None,
+            "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0},
+            "positive_rate": 0.0,
+        }
+
+    y_pred = (y_score >= threshold).astype(np.int64)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    try:
+        roc_auc = roc_auc_score(y_true, y_score)
+    except ValueError:
+        roc_auc = None
+    try:
+        avg_precision = average_precision_score(y_true, y_score)
+    except ValueError:
+        avg_precision = None
+
+    return {
+        "threshold": float(threshold),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "roc_auc": None if roc_auc is None else float(roc_auc),
+        "average_precision": None if avg_precision is None else float(avg_precision),
+        "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+        "positive_rate": float(y_true.mean()) if len(y_true) else 0.0,
+    }
 
 
 def get_feature_tokens(row: dict[str, object]) -> list[str]:
@@ -393,12 +467,7 @@ def evaluate(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "roc_auc": None if roc_auc is None else float(roc_auc),
         "average_precision": None if avg_precision is None else float(avg_precision),
-        "confusion_matrix": {
-            "tn": int(tn),
-            "fp": int(fp),
-            "fn": int(fn),
-            "tp": int(tp),
-        },
+        "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
         "positive_rate": float(y_true.mean()) if len(y_true) else 0.0,
     }
 
@@ -416,8 +485,35 @@ def evaluate_by_family(
     metrics: dict[str, dict[str, object]] = {}
     for family, indexes in sorted(indexes_by_family.items()):
         index_array = np.asarray(indexes, dtype=np.int64)
-        metrics[family] = evaluate(y_true[index_array], y_score[index_array], threshold)
+        metrics[family] = evaluate_rows([rows[i] for i in indexes], y_true[index_array], y_score[index_array], threshold)
     return metrics
+
+
+def evaluate_policy_metrics(
+    rows: list[dict[str, object]],
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float,
+) -> dict[str, dict[str, object]]:
+    indexes_all = np.arange(len(rows), dtype=np.int64)
+    indexes_runtime = np.asarray([i for i, row in enumerate(rows) if is_runtime_block_capable(row)], dtype=np.int64)
+    indexes_shell = np.asarray([i for i, row in enumerate(rows) if get_family(row) == "shell"], dtype=np.int64)
+    indexes_native = np.asarray(
+        [i for i, row in enumerate(rows) if get_family(row) == "native" and not is_never_block_native_tool(row.get("tool"))],
+        dtype=np.int64,
+    )
+
+    def slice_metrics(indexes: np.ndarray) -> dict[str, object]:
+        if len(indexes) == 0:
+            return evaluate_rows([], y_true[:0], y_score[:0], threshold)
+        return evaluate_rows([rows[int(i)] for i in indexes], y_true[indexes], y_score[indexes], threshold)
+
+    return {
+        "all": slice_metrics(indexes_all),
+        "runtime_block_capable": slice_metrics(indexes_runtime),
+        "shell": slice_metrics(indexes_shell),
+        "native_block_capable": slice_metrics(indexes_native),
+    }
 
 
 def onnx_positive_proba(session: ort.InferenceSession, texts: list[str]) -> np.ndarray:
@@ -480,6 +576,7 @@ def build_manifest(
     sklearn_test_family_metrics: dict[str, dict[str, object]],
     onnx_metrics: dict[str, object],
     onnx_family_metrics: dict[str, dict[str, object]],
+    onnx_policy_metrics: dict[str, dict[str, object]],
     parity_max_abs_diff: float,
     sklearn_path: Path,
     onnx_path: Path,
@@ -529,6 +626,7 @@ def build_manifest(
             "test_sklearn_by_family": sklearn_test_family_metrics,
             "test_onnx": onnx_metrics,
             "test_onnx_by_family": onnx_family_metrics,
+            "test_onnx_policy": onnx_policy_metrics,
             "onnx_parity_max_abs_diff": parity_max_abs_diff,
         },
         "artifacts": {
@@ -586,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
     onnx_score = onnx_positive_proba(session, test_texts)
     onnx_metrics = evaluate(y_test, onnx_score, threshold)
     onnx_family_metrics = evaluate_by_family(split_rows["test"], y_test, onnx_score, threshold)
+    onnx_policy_metrics = evaluate_policy_metrics(split_rows["test"], y_test, onnx_score, threshold)
     sklearn_test_score = positive_proba(pipeline, test_texts)
     sklearn_test_metrics = evaluate(y_test, sklearn_test_score, threshold)
     sklearn_test_family_metrics = evaluate_by_family(split_rows["test"], y_test, sklearn_test_score, threshold)
@@ -602,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
         sklearn_test_family_metrics,
         onnx_metrics,
         onnx_family_metrics,
+        onnx_policy_metrics,
         parity_max_abs_diff,
         sklearn_path,
         onnx_path,

@@ -50,8 +50,8 @@ uv run casifier-build-dataset --input tool-calls.jsonl --output-dir dataset-shel
 Default behavior:
 - deduplicates repeated tool inputs
 - labels a row as `blocked` if `total_chars >= 2000` or `total_lines >= 80`; semantically this means `large_output`
-- keeps shell command features for `bash`
-- adds structured-input features for native tools
+- keeps shell command features for `bash`, including generic flag-name / short-flag / numeric buckets and output-control tokens
+- adds structured-input features for native tools, including capped field-name tokens, field classes, and limit-value buckets
 - uses `--tool-identity hash` by default for native tools
 - writes:
   - `dataset-shell/train.jsonl`
@@ -83,7 +83,7 @@ The manifest also records the unified feature contract, including native tool id
 
 ## Model input
 
-The model input is a single token stream derived from shell commands or native tool JSON input. Shell features include command tokens, executable/subcommand markers, operators, flags, paths, URLs, globs, and bucketed aggregate counts. Native-tool features include JSON shape, value-type counts, string/path/URL-like markers, and optional tool identity (`hash`, `raw`, or `none`).
+The model input is a single token stream derived from shell commands or native tool JSON input. Shell features include command tokens, executable/subcommand markers, operators, flags, paths, URLs, globs, output-limiting / quieting cues (`--quiet`, `--silent`, `head -n`, `tail -n`, `Select-Object -First`, `git log -n`, `--tail`, `-m/--max-count`), and bucketed aggregate counts. Native-tool features include JSON shape, value-type counts, string/path/URL-like markers, and optional tool identity (`hash`, `raw`, or `none`).
 
 ## Artifacts
 
