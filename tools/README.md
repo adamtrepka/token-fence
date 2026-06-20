@@ -77,7 +77,9 @@ This produces:
 - `model-shell/threshold.json`
 - `model-shell/manifest.json`
 
-The manifest records the unified feature contract, including native tool identity mode, and reports metrics for all tools plus `shell` and `native` families separately.
+Default threshold selection targets validation precision `0.60` for binary blocking and falls back to F-beta only if no validation threshold meets that precision. The manifest records the selection method, target precision, and any fallback details.
+
+The manifest also records the unified feature contract, including native tool identity mode, and reports metrics for all tools plus `shell` and `native` families separately.
 
 ## Model input
 

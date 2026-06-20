@@ -97,7 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--threshold-beta",
         type=float,
         default=2.0,
-        help="Beta for recall-biased threshold selection on the validation set.",
+        help="Beta for fallback F-beta threshold selection on the validation set.",
+    )
+    parser.add_argument(
+        "--target-precision",
+        type=float,
+        default=0.60,
+        help="Target validation precision for block-threshold selection.",
     )
     parser.add_argument(
         "--seed",
@@ -315,6 +321,55 @@ def best_threshold(y_true: np.ndarray, y_score: np.ndarray, beta: float) -> tupl
     }
 
 
+def target_precision_threshold(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    target_precision: float,
+    beta: float,
+) -> tuple[float, dict[str, object]]:
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    if len(thresholds) == 0:
+        threshold, stats = best_threshold(y_true, y_score, beta)
+        return threshold, {
+            "method": "fbeta_fallback",
+            "target_precision": float(target_precision),
+            "fallback_used": True,
+            "fallback_reason": "validation_split_has_no_thresholds",
+            "selection_beta": float(beta),
+            "selection": stats,
+        }
+
+    precision = precision[:-1]
+    recall = recall[:-1]
+    qualifying = np.where(precision >= target_precision)[0]
+    if len(qualifying) > 0:
+        best_index = max(
+            qualifying,
+            key=lambda index: (float(recall[index]), -float(thresholds[index])),
+        )
+        return float(thresholds[best_index]), {
+            "method": "target_precision",
+            "target_precision": float(target_precision),
+            "fallback_used": False,
+            "fallback_reason": None,
+            "selection_beta": float(beta),
+            "selection": {
+                "precision": float(precision[best_index]),
+                "recall": float(recall[best_index]),
+            },
+        }
+
+    threshold, stats = best_threshold(y_true, y_score, beta)
+    return threshold, {
+        "method": "fbeta_fallback",
+        "target_precision": float(target_precision),
+        "fallback_used": True,
+        "fallback_reason": "no_validation_threshold_meets_target_precision",
+        "selection_beta": float(beta),
+        "selection": stats,
+    }
+
+
 def evaluate(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> dict[str, object]:
     y_pred = (y_score >= threshold).astype(np.int64)
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
@@ -458,7 +513,12 @@ def build_manifest(
         "threshold": {
             "block_threshold": threshold,
             "warn_threshold": warn_threshold(threshold),
-            "selection_beta": args.threshold_beta,
+            "selection_method": threshold_stats["method"],
+            "target_precision": threshold_stats["target_precision"],
+            "fallback_used": threshold_stats["fallback_used"],
+            "fallback_reason": threshold_stats["fallback_reason"],
+            "selection_beta": threshold_stats["selection_beta"],
+            "selection": threshold_stats["selection"],
             "validation": threshold_stats,
         },
         "dataset": {name: summarize_rows(rows) for name, rows in split_rows.items()},
@@ -502,7 +562,12 @@ def main(argv: list[str] | None = None) -> int:
     pipeline.fit(train_texts, y_train)
 
     val_score = positive_proba(pipeline, val_texts)
-    threshold, threshold_stats = best_threshold(y_val, val_score, args.threshold_beta)
+    threshold, threshold_stats = target_precision_threshold(
+        y_val,
+        val_score,
+        args.target_precision,
+        args.threshold_beta,
+    )
 
     val_metrics = evaluate(y_val, val_score, threshold)
     val_family_metrics = evaluate_by_family(split_rows["val"], y_val, val_score, threshold)

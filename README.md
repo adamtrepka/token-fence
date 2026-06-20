@@ -138,7 +138,7 @@ A row is labeled as positive / blocked when:
 
 Semantically this means `large_output`, not necessarily unsafe or malicious behavior.
 
-The final block threshold is selected on the validation set using a precision-recall curve and F-beta scoring. By default `beta=2.0`, so threshold selection is recall-biased: the model prefers catching likely large-output calls over minimizing false positives.
+The default block threshold is selected on the validation set to reach target precision `0.60` when possible; among qualifying thresholds it picks the one with the highest recall. If no validation threshold reaches the target, it falls back to F-beta scoring (`beta=2.0`).
 
 There is no separate probability calibration step beyond logistic regression probabilities and validation-based threshold selection.
 
