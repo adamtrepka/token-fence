@@ -156,6 +156,8 @@ let runtimeConfig = {
 let pluginClient = null;
 const sessionRoles = new Map();
 const sessionAgents = new Map();
+const BLOCKED_CALL_GUIDANCE =
+  "Token Fence blocked this parent-agent call because it is likely to produce excessive context/output or is too broad. Do not retry or work around it in the parent. Delegate the task to an appropriate subagent using a compact, bounded prompt; ask it to return only the needed result.";
 
 function stripQuotes(token) {
   return token.replace(/^["'`]+|["'`]+$/g, "");
@@ -226,6 +228,10 @@ function shellishTokens(command) {
     tokens.push(raw);
   }
   return tokens;
+}
+
+function buildBlockedCallMessage({ toolLabel, agentRole, agentName, scoreText, thresholdText, detailLabel, detailText }) {
+  return `Token Fence blocked ${toolLabel} for ${agentRole} agent${agentName ? ` (${agentName})` : ""}. ${BLOCKED_CALL_GUIDANCE} score=${scoreText}, threshold=${thresholdText}${detailText ? `, ${detailLabel}=${detailText}` : ""}`;
 }
 
 function classifyToken(token) {
@@ -1224,7 +1230,15 @@ async function handleShellToolBefore(input, output, defaultWorkdir, agentRole, a
 
   if (score >= state.blockThreshold) {
     throw new Error(
-      `shell guard blocked command for ${agentRole} agent${agentName ? ` (${agentName})` : ""} (score=${scoreText}, threshold=${state.blockThreshold.toFixed(3)}): ${commandText}`
+      buildBlockedCallMessage({
+        toolLabel: "shell command",
+        agentRole,
+        agentName,
+        scoreText,
+        thresholdText: state.blockThreshold.toFixed(3),
+        detailLabel: "command",
+        detailText: commandText,
+      })
     );
   }
 
@@ -1276,8 +1290,17 @@ async function handleNativeToolBefore(input, output, agentRole, agentName) {
   }
 
   if (policy === "block_capable" && score >= state.blockThreshold) {
+    const inputText = truncate(JSON.stringify(resolveNativeInputRaw(input, output)));
     throw new Error(
-      `shell guard blocked ${tool} tool for ${agentRole} agent${agentName ? ` (${agentName})` : ""} (score=${scoreText}, threshold=${state.blockThreshold.toFixed(3)})`
+      buildBlockedCallMessage({
+        toolLabel: `${tool} tool`,
+        agentRole,
+        agentName,
+        scoreText,
+        thresholdText: state.blockThreshold.toFixed(3),
+        detailLabel: "input",
+        detailText: inputText,
+      })
     );
   }
 
